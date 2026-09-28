@@ -1,0 +1,18 @@
+# Build & IDE
+.vscode/
+.idea/
+*.bin
+*.elf
+*.hex
+build/
+.pio/
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+venv/
+.env
+
+# Logs
+*.log

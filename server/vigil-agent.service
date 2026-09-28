@@ -1,0 +1,14 @@
+[Unit]
+Description=Sistema Vigil - Servico de Monitoramento de Servidor
+After=network.target
+
+[Service]
+Type=simple
+User=root
+WorkingDirectory=/opt/vigil
+ExecStart=/usr/bin/python3 /opt/vigil/server_agent.py
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target
