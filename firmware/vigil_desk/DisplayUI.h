@@ -3,6 +3,7 @@
  * SISTEMA VIGIL - VIGIL DESK DASHBOARD
  * ============================================================================
  * Renderizacao fluida (Anti-flicker) para display ILI9341 320x240 + EC11 Encoder.
+ * Suporte a Alertas Térmicos, Monitor de Serviços Docker e Modo AP.
  * ============================================================================
  */
 
@@ -20,6 +21,7 @@ private:
   Adafruit_ILI9341 tft;
   ScreenMode currentMode = MODE_SERVER_STATS;
   bool needFullRedraw = true;
+  String lastAlertLevel = "normal";
 
 public:
   DisplayUI() : tft(TFT_CS, TFT_DC, TFT_RST) {}
@@ -27,7 +29,7 @@ public:
   void begin() {
     SPI.begin(18, 19, 23, TFT_CS);
     tft.begin();
-    tft.setRotation(1); // Modo Paisagem (320x240)
+    tft.setRotation(1); // Paisagem (320x240)
     tft.fillScreen(ILI9341_BLACK);
     needFullRedraw = true;
   }
@@ -92,13 +94,19 @@ public:
     tft.setTextSize(1);
     tft.setTextColor(ILI9341_LIGHTGREY, ILI9341_BLACK);
     tft.setCursor(24, 190);
-    tft.print("Clique no encoder para cancelar");
+    tft.print("Clique no encoder para sair");
   }
 
   void render(const ServerMetrics& srv, const FieldStationMetrics& st, const ServicesMetrics& srvc, const String& timeStr, const String& dateStr, const String& wifiSsid, const String& ipStr) {
+    // Se o estado de alerta mudou de normal para critico ou vice-versa, redesenha o cabecalho
+    if (srv.alertLevel != lastAlertLevel) {
+      lastAlertLevel = srv.alertLevel;
+      needFullRedraw = true;
+    }
+
     if (needFullRedraw) {
       tft.fillScreen(ILI9341_BLACK);
-      renderHeader();
+      renderHeader(srv);
       renderStaticLayout();
       needFullRedraw = false;
     }
@@ -122,24 +130,34 @@ public:
   }
 
 private:
-  void renderHeader() {
-    tft.fillRect(0, 0, 320, 26, ILI9341_NAVY);
-    tft.drawFastHLine(0, 26, 320, ILI9341_BLUE);
-    tft.setTextColor(ILI9341_WHITE, ILI9341_NAVY);
+  void renderHeader(const ServerMetrics& srv) {
+    bool isCrit = (srv.alertLevel == "critical" || srv.cpuTemp >= 75.0);
+    bool isWarn = (srv.alertLevel == "warning" || srv.cpuTemp >= 65.0);
+
+    uint16_t bg = isCrit ? ILI9341_RED : (isWarn ? 0x9B20 /* Dark Orange */ : ILI9341_NAVY);
+    uint16_t border = isCrit ? ILI9341_MAROON : (isWarn ? ILI9341_YELLOW : ILI9341_BLUE);
+
+    tft.fillRect(0, 0, 320, 26, bg);
+    tft.drawFastHLine(0, 26, 320, border);
+    tft.setTextColor(ILI9341_WHITE, bg);
     tft.setTextSize(2);
     tft.setCursor(8, 5);
 
-    switch (currentMode) {
-      case MODE_SERVER_STATS:   tft.print("VIGIL // SERVIDOR"); break;
-      case MODE_FIELD_STATION:  tft.print("VIGIL // CAMPO"); break;
-      case MODE_SERVICES_STATUS:tft.print("VIGIL // DOCKER"); break;
-      case MODE_CLOCK_WIDGET:   tft.print("VIGIL // DESK CLOCK"); break;
-      default: break;
+    if (isCrit) {
+      tft.print("! ALERTA TERMICO !");
+    } else {
+      switch (currentMode) {
+        case MODE_SERVER_STATS:   tft.print("VIGIL // SERVIDOR"); break;
+        case MODE_FIELD_STATION:  tft.print("VIGIL // CAMPO"); break;
+        case MODE_SERVICES_STATUS:tft.print("VIGIL // SERVICOS"); break;
+        case MODE_CLOCK_WIDGET:   tft.print("VIGIL // DESK CLOCK"); break;
+        default: break;
+      }
     }
 
     // Indicador de Telas (Pontos no canto direito)
     for (int i = 0; i < NUM_MODES; i++) {
-      uint16_t color = (i == currentMode) ? ILI9341_YELLOW : ILI9341_DARKGREY;
+      uint16_t color = (i == currentMode) ? (isCrit ? ILI9341_WHITE : ILI9341_YELLOW) : ILI9341_DARKGREY;
       tft.fillCircle(265 + (i * 13), 13, 4, color);
     }
   }
@@ -150,20 +168,20 @@ private:
         tft.drawRoundRect(8, 32, 304, 202, 6, ILI9341_CYAN);
         tft.setTextColor(ILI9341_LIGHTGREY, ILI9341_BLACK);
         tft.setTextSize(1);
-        tft.setCursor(18, 68);  tft.print("CPU:");
-        tft.setCursor(18, 93);  tft.print("RAM:");
-        tft.setCursor(18, 118); tft.print("DISCO:");
+        tft.setCursor(18, 70);  tft.print("CPU:");
+        tft.setCursor(18, 95);  tft.print("RAM:");
+        tft.setCursor(18, 120); tft.print("DISCO:");
         
-        tft.drawRect(80, 66, 170, 11, ILI9341_DARKGREY);
-        tft.drawRect(80, 91, 170, 11, ILI9341_DARKGREY);
-        tft.drawRect(80, 116, 170, 11, ILI9341_DARKGREY);
+        tft.drawRect(80, 68, 170, 11, ILI9341_DARKGREY);
+        tft.drawRect(80, 93, 170, 11, ILI9341_DARKGREY);
+        tft.drawRect(80, 118, 170, 11, ILI9341_DARKGREY);
 
         // Caixa de Rede
-        tft.drawRoundRect(16, 138, 288, 56, 4, ILI9341_DARKGREY);
-        tft.setCursor(24, 144);
+        tft.drawRoundRect(16, 140, 288, 54, 4, ILI9341_DARKGREY);
+        tft.setCursor(24, 146);
         tft.setTextColor(ILI9341_CYAN, ILI9341_BLACK);
         tft.print("TRAFEGO DE REDE (ETH)");
-        tft.setCursor(24, 160);
+        tft.setCursor(24, 161);
         tft.setTextColor(ILI9341_GREEN, ILI9341_BLACK);
         tft.print("DOWNLOAD (RX):");
         tft.setCursor(24, 176);
@@ -203,9 +221,9 @@ private:
       case MODE_SERVICES_STATUS:
         tft.drawRoundRect(8, 32, 304, 202, 6, ILI9341_MAGENTA);
         tft.setTextColor(ILI9341_WHITE, ILI9341_BLACK);
-        tft.setTextSize(2);
+        tft.setTextSize(1);
         tft.setCursor(18, 44);
-        tft.print("SERVICOS ATIVOS");
+        tft.print("STATUS DOS SERVICOS & DOCKER LOCAL");
         break;
 
       case MODE_CLOCK_WIDGET:
@@ -222,12 +240,14 @@ private:
     tft.setTextColor(ILI9341_WHITE, ILI9341_BLACK);
     tft.print("Host: Servidor1");
 
-    uint16_t tempCol = (srv.cpuTemp > 75.0) ? ILI9341_RED : ((srv.cpuTemp > 60.0) ? ILI9341_YELLOW : ILI9341_GREEN);
+    // Destaque Termico
+    uint16_t tempCol = (srv.cpuTemp >= 75.0) ? ILI9341_RED : ((srv.cpuTemp >= 65.0) ? ILI9341_YELLOW : ILI9341_GREEN);
+    tft.drawRoundRect(126, 38, 96, 18, 3, tempCol);
     tft.setTextColor(tempCol, ILI9341_BLACK);
-    tft.setCursor(135, 44);
+    tft.setCursor(132, 43);
     tft.printf("Temp: %4.1f C", srv.cpuTemp);
 
-    tft.setCursor(235, 44);
+    tft.setCursor(232, 44);
     if (srv.serverOnline) {
       tft.setTextColor(ILI9341_GREEN, ILI9341_BLACK);
       tft.print("[ ONLINE ]");
@@ -237,20 +257,20 @@ private:
     }
 
     // CPU
-    drawBar(82, 68, 166, 7, srv.cpuUsage, ILI9341_GREEN, ILI9341_RED);
+    drawBar(82, 70, 166, 7, srv.cpuUsage, ILI9341_GREEN, ILI9341_RED);
     tft.setTextSize(1);
     tft.setTextColor(ILI9341_WHITE, ILI9341_BLACK);
-    tft.setCursor(256, 68);
+    tft.setCursor(256, 70);
     tft.printf("%5.1f%%", srv.cpuUsage);
 
     // RAM
-    drawBar(82, 93, 166, 7, srv.ramUsage, ILI9341_CYAN, ILI9341_RED);
-    tft.setCursor(256, 93);
+    drawBar(82, 95, 166, 7, srv.ramUsage, ILI9341_CYAN, ILI9341_RED);
+    tft.setCursor(256, 95);
     tft.printf("%5.1f%%", srv.ramUsage);
 
     // DISK
-    drawBar(82, 118, 166, 7, srv.diskUsage, ILI9341_YELLOW, ILI9341_RED);
-    tft.setCursor(256, 118);
+    drawBar(82, 120, 166, 7, srv.diskUsage, ILI9341_YELLOW, ILI9341_RED);
+    tft.setCursor(256, 120);
     tft.printf("%5.1f%%", srv.diskUsage);
 
     // Rede RX / TX
@@ -309,52 +329,64 @@ private:
   }
 
   void updateServicesStatus(const ServicesMetrics& s) {
-    const char* names[4] = {"Servidor HTTP (:3000)", "Monitor Agent (:5000)", "PostgreSQL DB (:5432)", "Mosquitto MQTT (:1883)"};
-    bool ok[4] = {s.serverApiOk, s.agentApiOk, s.postgresOk, s.mosquittoOk};
+    const char* names[4] = {"Gaia Server (:3000)", "Agroclima Server (:3001)", "PostgreSQL DB (:5432)", "Mosquitto MQTT (:1883)"};
+    bool ok[4] = {s.serverApiOk, s.agroclimaOk, s.postgresOk, s.mosquittoOk};
 
     tft.setTextSize(1);
     for (int i = 0; i < 4; i++) {
-      int y = 70 + (i * 32);
-      tft.drawRoundRect(16, y, 288, 26, 3, ILI9341_DARKGREY);
+      int y = 64 + (i * 34);
+      tft.drawRoundRect(16, y, 288, 28, 4, ok[i] ? 0x2410 : 0x8000);
       tft.setTextColor(ILI9341_WHITE, ILI9341_BLACK);
-      tft.setCursor(26, y + 8);
+      tft.setCursor(26, y + 10);
       tft.print(names[i]);
 
-      tft.setCursor(230, y + 8);
+      tft.setCursor(226, y + 10);
       tft.setTextColor(ok[i] ? ILI9341_GREEN : ILI9341_RED, ILI9341_BLACK);
-      tft.print(ok[i] ? "[ ATIVO ]" : "[ ATIVO ]");
+      tft.print(ok[i] ? "[ ATIVO ]" : "[OFFLINE]");
     }
 
     tft.setTextColor(ILI9341_CYAN, ILI9341_BLACK);
     tft.setCursor(18, 208);
-    tft.printf("Latencia da Rede LAN: ~%d ms", s.pingMs);
+    tft.printf("Latencia Local da LAN: ~%d ms", s.pingMs);
   }
 
   void updateClockWidget(const ServerMetrics& srv, const String& timeStr, const String& dateStr, const String& wifiSsid, const String& ipStr) {
     tft.setTextSize(5);
     tft.setTextColor(ILI9341_GREEN, ILI9341_BLACK);
-    tft.setCursor(35, 65);
+    tft.setCursor(35, 55);
     tft.print(timeStr);
 
     tft.setTextSize(2);
     tft.setTextColor(ILI9341_WHITE, ILI9341_BLACK);
-    tft.setCursor(35, 120);
+    tft.setCursor(35, 110);
     tft.print(dateStr);
 
-    // Resumo
+    // Banner de Alerta / Status
     tft.setTextSize(1);
-    uint16_t tempCol = (srv.cpuTemp > 75.0) ? ILI9341_RED : ((srv.cpuTemp > 60.0) ? ILI9341_YELLOW : ILI9341_GREEN);
-    tft.setTextColor(tempCol, ILI9341_BLACK);
-    tft.setCursor(20, 160);
-    tft.printf("Servidor: %4.1f C  |  CPU: %4.1f%%  |  RAM: %4.1f%%", srv.cpuTemp, srv.cpuUsage, srv.ramUsage);
+    if (srv.alertLevel == "critical") {
+      tft.fillRect(16, 142, 288, 20, ILI9341_RED);
+      tft.setTextColor(ILI9341_WHITE, ILI9341_RED);
+      tft.setCursor(24, 148);
+      tft.print("! ALERTA: " + srv.alertMsg);
+    } else if (srv.alertLevel == "warning") {
+      tft.fillRect(16, 142, 288, 20, 0x9B20);
+      tft.setTextColor(ILI9341_WHITE, 0x9B20);
+      tft.setCursor(24, 148);
+      tft.print("! AVISO: " + srv.alertMsg);
+    } else {
+      uint16_t tempCol = (srv.cpuTemp > 65.0) ? ILI9341_YELLOW : ILI9341_GREEN;
+      tft.setTextColor(tempCol, ILI9341_BLACK);
+      tft.setCursor(20, 148);
+      tft.printf("Servidor: %4.1f C  |  CPU: %4.1f%%  |  RAM: %4.1f%%", srv.cpuTemp, srv.cpuUsage, srv.ramUsage);
+    }
 
     tft.setTextColor(ILI9341_YELLOW, ILI9341_BLACK);
-    tft.setCursor(20, 185);
+    tft.setCursor(20, 178);
     tft.printf("WiFi: %-16s | IP: %s", wifiSsid.c_str(), ipStr.c_str());
 
     tft.setTextColor(ILI9341_CYAN, ILI9341_BLACK);
     tft.setCursor(20, 205);
-    tft.print("Painel Vigil: http://IP_DO_SERVIDOR:5000");
+    tft.print("Painel Vigil: http://192.168.0.105:5000");
   }
 
   void drawBar(int x, int y, int w, int h, float pct, uint16_t okColor, uint16_t alertColor) {

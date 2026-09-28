@@ -157,7 +157,9 @@ void fetchServerMetrics() {
     serverMetrics.serverOnline = false;
     stationMetrics.stationOnline = false;
     servicesMetrics.serverApiOk = false;
-    servicesMetrics.agentApiOk = false;
+    servicesMetrics.agroclimaOk = false;
+    servicesMetrics.postgresOk = false;
+    servicesMetrics.mosquittoOk = false;
     return;
   }
 
@@ -172,7 +174,7 @@ void fetchServerMetrics() {
     #if ARDUINOJSON_VERSION_MAJOR >= 7
       JsonDocument doc;
     #else
-      StaticJsonDocument<1024> doc;
+      StaticJsonDocument<2048> doc;
     #endif
 
     DeserializationError error = deserializeJson(doc, payload);
@@ -187,6 +189,8 @@ void fetchServerMetrics() {
       serverMetrics.netRxKBps    = doc["server"]["rx_kbps"] | 0.0f;
       serverMetrics.netTxKBps    = doc["server"]["tx_kbps"] | 0.0f;
       serverMetrics.uptimeSec    = doc["server"]["uptime_sec"] | 0;
+      serverMetrics.alertLevel   = doc["server"]["alert_level"] | "normal";
+      serverMetrics.alertMsg     = doc["server"]["alert_msg"] | "Sistema normal";
 
       // Metricas da Estacao
       JsonObject stObj = doc["station"].is<JsonObject>() ? doc["station"] : doc["gaia"];
@@ -201,14 +205,18 @@ void fetchServerMetrics() {
       stationMetrics.secondsAgo     = stObj["sec_ago"] | 999;
 
       // Status dos Servicos
-      servicesMetrics.agentApiOk   = true;
-      servicesMetrics.serverApiOk  = (gStatus == "ONLINE" || stationMetrics.secondsAgo < 180);
-      servicesMetrics.postgresOk   = true;
-      servicesMetrics.mosquittoOk  = true;
+      JsonObject sMap = doc["services_status"];
+      if (!sMap.isNull()) {
+        servicesMetrics.serverApiOk  = sMap["serverApiOk"] | true;
+        servicesMetrics.agroclimaOk  = sMap["agroclimaOk"] | true;
+        servicesMetrics.postgresOk   = sMap["postgresOk"] | true;
+        servicesMetrics.mosquittoOk  = sMap["mosquittoOk"] | true;
+        servicesMetrics.pingMs       = sMap["pingMs"] | 2;
+      }
     }
   } else {
     serverMetrics.serverOnline = false;
-    servicesMetrics.agentApiOk = false;
+    servicesMetrics.serverApiOk = false;
   }
   http.end();
 }
@@ -238,43 +246,46 @@ void setup() {
   serverURL = preferences.getString("server_url", DEFAULT_SERVER_URL);
   preferences.end();
 
-  Serial.printf("[CONFIG] Wi-Fi Alvo: %s\n", wifiSSID.c_str());
-  Serial.printf("[CONFIG] Servidor:   %s\n", serverURL.c_str());
+  Serial.printf("[CONFIG] WiFi SSID Salvo: %s\n", wifiSSID.c_str());
+  Serial.printf("[CONFIG] Endpoint Salvo:  %s\n", serverURL.c_str());
 
-  // 4. Se o botao do Encoder estiver pressionado durante o boot -> Entra direto no Modo AP!
+  // 4. Checagem de Acionamento Manual do Modo AP no Boot (segurar botao por 1s)
   if (digitalRead(ENCODER_SW) == LOW) {
-    Serial.println("[BOOT] Botao do encoder pressionado durante ligamento -> Ativando Modo AP!");
+    Serial.println("[BOOT] Botao do encoder pressionado no boot. Entrando no MODO AP...");
     iniciarModoAP();
     return;
   }
 
-  // 5. Conexao Wi-Fi
-  Serial.printf("[WIFI] Conectando a %s...\n", wifiSSID.c_str());
+  // 5. Conectar ao Wi-Fi Station
+  Serial.printf("[WIFI] Conectando a %s...", wifiSSID.c_str());
   WiFi.mode(WIFI_STA);
   WiFi.begin(wifiSSID.c_str(), wifiPASS.c_str());
 
-  int retries = 0;
-  while (WiFi.status() != WL_CONNECTED && retries < 18) {
-    delay(400);
+  unsigned long startWifi = millis();
+  while (WiFi.status() != WL_CONNECTED && (millis() - startWifi < 7000)) {
+    delay(250);
     Serial.print(".");
-    retries++;
   }
 
   if (WiFi.status() == WL_CONNECTED) {
-    Serial.println("\n[WIFI] Vigil conectado com sucesso!");
-    Serial.printf("[WIFI] IP Obtido: %s\n", WiFi.localIP().toString().c_str());
+    Serial.println("\n[WIFI] Conectado com sucesso!");
+    Serial.print("[WIFI] Endereco IP: ");
+    Serial.println(WiFi.localIP());
 
-    // Sincroniza NTP para o Relogio
-    configTime(-3 * 3600, 0, "a.st1.ntp.br", "pool.ntp.org");
+    // Sincronizar Relogio NTP (Horario de Brasilia UTC-3)
+    configTime(-3 * 3600, 0, "a.st1.ntp.br", "pool.ntp.org", "time.google.com");
+    Serial.println("[NTP] Sincronizacao de horario UTC-3 iniciada.");
+
+    // Primeira consulta a API
+    fetchServerMetrics();
   } else {
-    // Falha ao conectar: inicia Modo AP para permitir trocar a rede
-    Serial.println("\n[WIFI] Nao foi possivel conectar na rede. Iniciando Modo AP...");
+    Serial.println("\n[WIFI] Falha ao conectar na rede configurada em 7s.");
+    Serial.println("[WIFI] Acionando Modo AP automaticamente para reconfiguracao...");
     iniciarModoAP();
   }
 }
 
 void loop() {
-  // Se estiver em Modo AP, processa requisicoes do portal web de configuracao
   if (isAPMode) {
     apServer.handleClient();
     checkEncoderButton();

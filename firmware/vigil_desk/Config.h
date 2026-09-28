@@ -25,7 +25,6 @@
 
 // ----------------------------------------------------------------------------
 // MAPEAMENTO DE PINOS (DISPLAY TFT ILI9341 SPI & CARTÃO SD)
-// Pinos padrão compatíveis com placas ESP32 DevKit e PCBs dedicadas.
 // ----------------------------------------------------------------------------
 #define TFT_CS   5   // Chip Select do Display
 #define TFT_DC   2   // Data / Command do Display
@@ -66,6 +65,8 @@ struct ServerMetrics {
   float netTxKBps = 0.0;      // Upload KB/s
   float netRxKBps = 0.0;      // Download KB/s
   uint32_t uptimeSec = 0;     // Uptime em segundos
+  String alertLevel = "normal"; // "normal", "warning", "critical"
+  String alertMsg = "Sistema normal";
 };
 
 // Métricas de Estação Remota / Sensores de Campo
@@ -82,10 +83,10 @@ struct FieldStationMetrics {
 
 // Status dos Serviços
 struct ServicesMetrics {
-  bool serverApiOk = true;
-  bool agentApiOk = true;
-  bool postgresOk = true;
-  bool mosquittoOk = true;
+  bool serverApiOk = true;   // Core API (:3000)
+  bool agroclimaOk = true;   // Microservice (:3001)
+  bool postgresOk = true;    // DB (:5432)
+  bool mosquittoOk = true;   // Broker MQTT (:1883)
   int pingMs = 2;
 };
 

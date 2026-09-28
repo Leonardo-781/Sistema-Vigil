@@ -4,27 +4,44 @@
 ==============================================================================
 SISTEMA VIGIL - VIGIL AGENT & WEB DASHBOARD
 ==============================================================================
-Agente de monitoramento ultraleve para servidores Linux/Windows com dashboard
-web em tempo real e fornecimento de métricas via API JSON para o Vigil Desk.
+Observabilidade de Servidores, Monitoramento Térmico e Telemetria de Campo
 ==============================================================================
 """
 
 import time
 import os
 import json
+import socket
+import collections
+import threading
 import urllib.request
 import psutil
 from http.server import HTTPServer, BaseHTTPRequestHandler
 
-# Configuração de portas e endpoints
-PORT = int(os.getenv("VIGIL_PORT", 5000))
-EXTERNAL_STATION_URL = os.getenv("STATION_API_URL", "http://127.0.0.1:3000/api/estacoes")
+# Ring buffer de histórico para gráficos em tempo real (últimos 30 pontos)
+history_lock = threading.Lock()
+history_cpu = collections.deque(maxlen=30)
+history_temp = collections.deque(maxlen=30)
+history_ram = collections.deque(maxlen=30)
 
 last_net = psutil.net_io_counters()
 last_time = time.time()
 
+# Cache de métricas atuais
+current_metrics = {
+    "cpu": 0.0,
+    "cpu_temp": 0.0,
+    "ram": 0.0,
+    "disk": 0.0,
+    "rx_kbps": 0.0,
+    "tx_kbps": 0.0,
+    "uptime_sec": 0,
+    "alert_level": "normal",
+    "alert_msg": "Sistema operando normalmente",
+    "alerts": []
+}
+
 def get_cpu_temp():
-    """Lê a temperatura da CPU através do subsistema térmico do SO."""
     try:
         temps = psutil.sensors_temperatures()
         if 'coretemp' in temps and len(temps['coretemp']) > 0:
@@ -43,10 +60,33 @@ def get_cpu_temp():
         pass
     return 0.0
 
-def get_field_station_metrics():
-    """Consulta dados de sensores externos ou estação de campo (opcional)."""
+def check_port(host, port, timeout=0.12):
     try:
-        req = urllib.request.Request(EXTERNAL_STATION_URL, headers={"User-Agent": "VigilAgent/1.0"})
+        with socket.create_connection((host, port), timeout=timeout):
+            return True
+    except Exception:
+        return False
+
+def get_services_status():
+    t0 = time.time()
+    s_gaia = check_port('127.0.0.1', 3000)
+    s_agro = check_port('127.0.0.1', 3001)
+    s_pg = check_port('127.0.0.1', 5432)
+    s_mqtt = check_port('127.0.0.1', 1883)
+    s_nginx = check_port('127.0.0.1', 80)
+    ping_ms = max(1, int((time.time() - t0) * 1000))
+    
+    return [
+        {"name": "Gaia Server", "port": 3000, "status": s_gaia, "type": "API / Backend"},
+        {"name": "Agroclima Server", "port": 3001, "status": s_agro, "type": "Microserviço"},
+        {"name": "PostgreSQL DB", "port": 5432, "status": s_pg, "type": "Banco de Dados"},
+        {"name": "Mosquitto MQTT", "port": 1883, "status": s_mqtt, "type": "Broker IoT"},
+        {"name": "Nginx Proxy", "port": 80, "status": s_nginx, "type": "Reverse Proxy"}
+    ], ping_ms
+
+def get_field_station_metrics():
+    try:
+        req = urllib.request.Request("http://127.0.0.1:3000/api/estacoes", headers={"User-Agent": "VigilAgent/2.0"})
         with urllib.request.urlopen(req, timeout=2) as resp:
             data = json.loads(resp.read().decode('utf-8'))
             if isinstance(data, list) and len(data) > 0:
@@ -54,7 +94,7 @@ def get_field_station_metrics():
                 return {
                     "station": st.get("cod_estacao", "G00001"),
                     "nome": st.get("nome", "Estacao G00001"),
-                    "cultura": st.get("cultura", "Monitor de Campo"),
+                    "cultura": st.get("cultura", "Cafe Arabica"),
                     "status": st.get("status", "ONLINE"),
                     "temp": float(st.get("temp_ref") or 0.0),
                     "umid": float(st.get("umidade") or 0.0),
@@ -69,7 +109,7 @@ def get_field_station_metrics():
     return {
         "station": "G00001",
         "nome": "Estacao G00001",
-        "cultura": "Monitor de Campo",
+        "cultura": "Cafe Arabica",
         "status": "OFFLINE",
         "temp": 0.0,
         "umid": 0.0,
@@ -80,6 +120,70 @@ def get_field_station_metrics():
         "sec_ago": 9999
     }
 
+def background_sampler():
+    """Coleta métricas continuamente a cada 1s para alimentar os gráficos em tempo real"""
+    global last_net, last_time, current_metrics
+    while True:
+        try:
+            now = time.time()
+            dt = max(now - last_time, 0.5)
+            curr_net = psutil.net_io_counters()
+            
+            rx_kbps = round(((curr_net.bytes_recv - last_net.bytes_recv) / 1024.0) / dt, 1)
+            tx_kbps = round(((curr_net.bytes_sent - last_net.bytes_sent) / 1024.0) / dt, 1)
+            last_net = curr_net
+            last_time = now
+
+            cpu = psutil.cpu_percent(interval=None)
+            cpu_temp = get_cpu_temp()
+            ram = psutil.virtual_memory().percent
+            disk = psutil.disk_usage('/').percent
+            uptime = int(now - psutil.boot_time())
+
+            with history_lock:
+                history_cpu.append(cpu)
+                history_temp.append(cpu_temp)
+                history_ram.append(ram)
+
+            # Classifica status de alerta
+            alerts = []
+            level = "normal"
+
+            if cpu_temp >= 75.0:
+                alerts.append(f"TEMPERATURA CRÍTICA: CPU em {cpu_temp:.1f}°C")
+                level = "critical"
+            elif cpu_temp >= 65.0:
+                alerts.append(f"Temperatura elevada: CPU em {cpu_temp:.1f}°C")
+                if level != "critical": level = "warning"
+
+            if cpu >= 90.0:
+                alerts.append(f"Sobrecarga de CPU: {cpu:.1f}%")
+                if level != "critical": level = "warning"
+
+            if ram >= 90.0:
+                alerts.append(f"Memória RAM alta: {ram:.1f}% em uso")
+                if level != "critical": level = "warning"
+
+            msg = "Sistema operando normalmente"
+            if alerts:
+                msg = alerts[0]
+
+            current_metrics = {
+                "cpu": cpu,
+                "cpu_temp": cpu_temp,
+                "ram": ram,
+                "disk": disk,
+                "rx_kbps": rx_kbps,
+                "tx_kbps": tx_kbps,
+                "uptime_sec": uptime,
+                "alert_level": level,
+                "alert_msg": msg,
+                "alerts": alerts
+            }
+        except Exception as e:
+            pass
+        time.sleep(1.2)
+
 HTML_DASHBOARD = """<!DOCTYPE html>
 <html lang="pt-BR">
 <head>
@@ -88,11 +192,11 @@ HTML_DASHBOARD = """<!DOCTYPE html>
   <title>Vigil // Monitor de Infraestrutura</title>
   <link rel="preconnect" href="https://fonts.googleapis.com">
   <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
-  <link href="https://fonts.googleapis.com/css2?family=Outfit:wght@300;400;500;600;700&family=JetBrains+Mono:wght@400;600&display=swap" rel="stylesheet">
+  <link href="https://fonts.googleapis.com/css2?family=Outfit:wght@300;400;500;600;700&family=JetBrains+Mono:wght@400;600;700&display=swap" rel="stylesheet">
   <style>
     :root {
       --bg: #0b0f19;
-      --card-bg: rgba(18, 24, 39, 0.75);
+      --card-bg: rgba(18, 24, 39, 0.78);
       --card-border: rgba(255, 255, 255, 0.08);
       --primary: #10b981;
       --primary-glow: rgba(16, 185, 129, 0.25);
@@ -105,32 +209,53 @@ HTML_DASHBOARD = """<!DOCTYPE html>
     * { box-sizing: border-box; margin: 0; padding: 0; }
     body {
       font-family: 'Outfit', -apple-system, sans-serif;
-      background: radial-gradient(circle at 15% 15%, #131c31 0%, #0b0f19 60%);
+      background: radial-gradient(circle at 15% 15%, #131c31 0%, #0b0f19 65%);
       color: var(--text);
       min-height: 100vh;
-      padding: 24px 16px 40px;
+      padding: 20px 16px 40px;
     }
-    .container { max-width: 1100px; margin: 0 auto; }
+    .container { max-width: 1140px; margin: 0 auto; }
     
+    /* Header */
     header {
-      display: flex; justify-content: space-between; align-items: center;
-      margin-bottom: 24px; flex-wrap: wrap; gap: 16px;
-      border-bottom: 1px solid var(--card-border); padding-bottom: 18px;
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      margin-bottom: 20px;
+      flex-wrap: wrap;
+      gap: 16px;
+      border-bottom: 1px solid var(--card-border);
+      padding-bottom: 16px;
     }
     .logo-area { display: flex; align-items: center; gap: 14px; }
     .logo-icon {
-      width: 44px; height: 44px; border-radius: 12px;
+      width: 46px; height: 46px; border-radius: 12px;
       background: linear-gradient(135deg, #10b981, #06b6d4);
       display: flex; align-items: center; justify-content: center;
-      font-weight: 800; font-size: 24px; color: #fff;
-      box-shadow: 0 0 22px var(--primary-glow);
-      letter-spacing: -0.5px;
+      font-weight: 800; font-size: 26px; color: #fff;
+      box-shadow: 0 0 24px var(--primary-glow);
     }
-    .title h1 { font-size: 22px; font-weight: 700; letter-spacing: -0.5px; }
+    .title h1 { font-size: 24px; font-weight: 700; letter-spacing: -0.5px; }
     .title p { font-size: 13px; color: var(--text-muted); }
+    
+    .header-actions { display: flex; align-items: center; gap: 12px; }
+    .btn-sound {
+      background: rgba(255, 255, 255, 0.06);
+      border: 1px solid var(--card-border);
+      color: var(--text);
+      padding: 7px 14px;
+      border-radius: 20px;
+      font-size: 13px;
+      cursor: pointer;
+      display: flex;
+      align-items: center;
+      gap: 6px;
+      transition: all 0.2s;
+    }
+    .btn-sound:hover { background: rgba(255, 255, 255, 0.12); }
     .badge-status {
       display: inline-flex; align-items: center; gap: 8px;
-      padding: 6px 14px; border-radius: 30px; font-size: 13px; font-weight: 600;
+      padding: 7px 16px; border-radius: 30px; font-size: 13px; font-weight: 600;
       background: rgba(16, 185, 129, 0.15); color: #34d399; border: 1px solid rgba(16, 185, 129, 0.3);
     }
     .pulse-dot {
@@ -143,26 +268,76 @@ HTML_DASHBOARD = """<!DOCTYPE html>
       100% { transform: scale(0.9); opacity: 1; }
     }
 
+    /* Alert Banner */
+    .alert-banner {
+      border-radius: 14px;
+      padding: 14px 20px;
+      margin-bottom: 22px;
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 16px;
+      transition: all 0.3s ease;
+    }
+    .alert-normal {
+      background: rgba(16, 185, 129, 0.08);
+      border: 1px solid rgba(16, 185, 129, 0.25);
+    }
+    .alert-warning {
+      background: rgba(245, 158, 11, 0.12);
+      border: 1px solid rgba(245, 158, 11, 0.4);
+      animation: alertPulse 2s infinite;
+    }
+    .alert-critical {
+      background: rgba(239, 68, 68, 0.18);
+      border: 1px solid rgba(239, 68, 68, 0.6);
+      box-shadow: 0 0 25px rgba(239, 68, 68, 0.3);
+      animation: alertFlash 1.2s infinite;
+    }
+    @keyframes alertPulse {
+      0% { border-color: rgba(245, 158, 11, 0.4); }
+      50% { border-color: rgba(245, 158, 11, 0.8); }
+      100% { border-color: rgba(245, 158, 11, 0.4); }
+    }
+    @keyframes alertFlash {
+      0% { background: rgba(239, 68, 68, 0.18); }
+      50% { background: rgba(239, 68, 68, 0.32); }
+      100% { background: rgba(239, 68, 68, 0.18); }
+    }
+    .alert-left { display: flex; align-items: center; gap: 14px; }
+    .alert-icon-box { font-size: 26px; }
+    .alert-title-text { font-size: 15px; font-weight: 700; letter-spacing: -0.3px; }
+    .alert-desc-text { font-size: 13px; color: var(--text-muted); margin-top: 2px; }
+
+    /* Grid Layout */
     .grid {
-      display: grid; grid-template-columns: repeat(auto-fit, minmax(320px, 1fr));
-      gap: 20px; margin-bottom: 24px;
+      display: grid;
+      grid-template-columns: repeat(auto-fit, minmax(340px, 1fr));
+      gap: 20px;
+      margin-bottom: 24px;
     }
     
+    /* Cards */
     .card {
-      background: var(--card-bg); border: 1px solid var(--card-border);
-      border-radius: 16px; padding: 22px; backdrop-filter: blur(12px);
+      background: var(--card-bg);
+      border: 1px solid var(--card-border);
+      border-radius: 16px;
+      padding: 22px;
+      backdrop-filter: blur(12px);
       box-shadow: 0 10px 30px -10px rgba(0,0,0,0.5);
-      transition: transform 0.2s ease, border-color 0.2s ease;
+      position: relative;
     }
-    .card:hover { border-color: rgba(255, 255, 255, 0.18); }
     .card-header {
-      display: flex; justify-content: space-between; align-items: center; margin-bottom: 18px;
+      display: flex; justify-content: space-between; align-items: center;
+      margin-bottom: 18px;
     }
     .card-title {
-      font-size: 15px; font-weight: 600; text-transform: uppercase;
-      letter-spacing: 0.8px; color: var(--text-muted); display: flex; align-items: center; gap: 8px;
+      font-size: 14px; font-weight: 600; text-transform: uppercase;
+      letter-spacing: 0.8px; color: var(--text-muted);
+      display: flex; align-items: center; gap: 8px;
     }
 
+    /* Server Card Elements */
     .metric-row { margin-bottom: 14px; }
     .metric-label-val { display: flex; justify-content: space-between; font-size: 14px; margin-bottom: 6px; }
     .metric-val { font-family: 'JetBrains Mono', monospace; font-weight: 600; }
@@ -170,15 +345,28 @@ HTML_DASHBOARD = """<!DOCTYPE html>
       height: 8px; background: rgba(255,255,255,0.08); border-radius: 6px; overflow: hidden;
     }
     .progress-bar-fill {
-      height: 100%; border-radius: 6px; transition: width 0.6s cubic-bezier(0.4, 0, 0.2, 1);
+      height: 100%; border-radius: 6px; transition: width 0.5s ease;
     }
     .fill-cpu { background: linear-gradient(90deg, #10b981, #06b6d4); }
     .fill-ram { background: linear-gradient(90deg, #06b6d4, #8b5cf6); }
     .fill-disk { background: linear-gradient(90deg, #f59e0b, #ec4899); }
 
+    /* Canvas Sparklines */
+    .sparkline-box {
+      margin-top: 14px; padding-top: 12px; border-top: 1px solid var(--card-border);
+    }
+    .sparkline-header {
+      display: flex; justify-content: space-between; font-size: 12px; color: var(--text-muted); margin-bottom: 6px;
+    }
+    .sparkline-canvas {
+      width: 100%; height: 42px; display: block; border-radius: 6px;
+      background: rgba(0,0,0,0.25);
+    }
+
+    /* Net stats pill */
     .net-box {
       display: grid; grid-template-columns: 1fr 1fr; gap: 12px;
-      margin-top: 18px; padding-top: 14px; border-top: 1px solid var(--card-border);
+      margin-top: 14px; padding-top: 12px; border-top: 1px solid var(--card-border);
     }
     .net-pill {
       background: rgba(255,255,255,0.03); border-radius: 10px; padding: 10px; text-align: center;
@@ -189,26 +377,49 @@ HTML_DASHBOARD = """<!DOCTYPE html>
     .rx-color { color: #34d399; }
     .tx-color { color: #fbbf24; }
 
+    /* Temp Badge */
     .temp-badge {
       display: inline-flex; align-items: center; gap: 6px;
       font-family: 'JetBrains Mono', monospace; font-size: 14px; font-weight: 700;
-      padding: 4px 10px; border-radius: 8px;
+      padding: 5px 12px; border-radius: 8px;
     }
-    .temp-good { background: rgba(16, 185, 129, 0.15); color: #34d399; }
-    .temp-warn { background: rgba(245, 158, 11, 0.15); color: #fbbf24; }
-    .temp-crit { background: rgba(239, 68, 68, 0.15); color: #f87171; }
+    .temp-good { background: rgba(16, 185, 129, 0.15); color: #34d399; border: 1px solid rgba(16,185,129,0.3); }
+    .temp-warn { background: rgba(245, 158, 11, 0.18); color: #fbbf24; border: 1px solid rgba(245,158,11,0.4); }
+    .temp-crit { background: rgba(239, 68, 68, 0.22); color: #f87171; border: 1px solid rgba(239,68,68,0.5); }
 
-    .station-tiles { display: grid; grid-template-columns: repeat(2, 1fr); gap: 12px; }
+    /* Station Stat Tiles */
+    .station-tiles {
+      display: grid; grid-template-columns: repeat(2, 1fr); gap: 12px;
+    }
     .station-tile {
       background: rgba(255,255,255,0.03); border: 1px solid rgba(255,255,255,0.06);
       border-radius: 12px; padding: 14px;
     }
     .station-tile-lbl { font-size: 12px; color: var(--text-muted); }
     .station-tile-val {
-      font-family: 'JetBrains Mono', monospace; font-size: 22px; font-weight: 700; margin-top: 4px;
+      font-family: 'JetBrains Mono', monospace; font-size: 22px; font-weight: 700;
+      margin-top: 4px;
     }
     .station-tile-unit { font-size: 13px; font-weight: 400; color: var(--text-muted); }
 
+    /* Services List */
+    .services-list { display: flex; flex-direction: column; gap: 10px; }
+    .service-item {
+      display: flex; justify-content: space-between; align-items: center;
+      background: rgba(255,255,255,0.03); border: 1px solid rgba(255,255,255,0.06);
+      padding: 10px 14px; border-radius: 10px;
+    }
+    .service-info { display: flex; flex-direction: column; gap: 2px; }
+    .service-name { font-size: 14px; font-weight: 600; }
+    .service-sub { font-size: 11px; color: var(--text-muted); }
+    .service-badge {
+      font-family: 'JetBrains Mono', monospace; font-size: 11px; font-weight: 700;
+      padding: 3px 8px; border-radius: 6px;
+    }
+    .srv-ok { background: rgba(16, 185, 129, 0.15); color: #34d399; border: 1px solid rgba(16,185,129,0.3); }
+    .srv-err { background: rgba(239, 68, 68, 0.15); color: #f87171; border: 1px solid rgba(239,68,68,0.3); }
+
+    /* Footer info */
     footer {
       display: flex; justify-content: space-between; align-items: center; flex-wrap: wrap;
       gap: 12px; font-size: 13px; color: var(--text-muted); padding-top: 14px;
@@ -227,10 +438,11 @@ HTML_DASHBOARD = """<!DOCTYPE html>
         <div class="logo-icon">V</div>
         <div class="title">
           <h1>Sistema Vigil</h1>
-          <p>Monitor de Infraestrutura &middot; Servidor &middot; Vigil Desk</p>
+          <p>Monitor de Infraestrutura &middot; Servidor Ubuntu &middot; Vigil Desk</p>
         </div>
       </div>
-      <div>
+      <div class="header-actions">
+        <button class="btn-sound" id="btn-sound" onclick="toggleSound()">🔔 Alertas Sonoros: Ligado</button>
         <div class="badge-status">
           <span class="pulse-dot"></span>
           <span id="conn-status">VIGIL ATIVO AO VIVO</span>
@@ -238,13 +450,25 @@ HTML_DASHBOARD = """<!DOCTYPE html>
       </div>
     </header>
 
+    <!-- Banner Dinâmico de Alertas -->
+    <div id="alert-banner" class="alert-banner alert-normal">
+      <div class="alert-left">
+        <div class="alert-icon-box" id="alert-icon">🛡️</div>
+        <div>
+          <div class="alert-title-text" id="alert-title">SISTEMA VIGIL OPERANDO NORMALMENTE</div>
+          <div class="alert-desc-text" id="alert-desc">Infraestrutura estável, parâmetros térmicos e telemetria sob controle.</div>
+        </div>
+      </div>
+      <div id="alert-stamp" style="font-family:'JetBrains Mono'; font-size:12px; color:var(--text-muted);">OK</div>
+    </div>
+
     <div class="grid">
       <!-- Card Servidor -->
       <div class="card">
         <div class="card-header">
           <div class="card-title">
             <svg width="18" height="18" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><rect x="2" y="2" width="20" height="8" rx="2"/><rect x="2" y="14" width="20" height="8" rx="2"/><line x1="6" y1="6" x2="6.01" y2="6"/><line x1="6" y1="18" x2="6.01" y2="18"/></svg>
-            Servidor Host
+            Servidor Ubuntu (IP_DO_SERVIDOR)
           </div>
           <div id="temp-badge" class="temp-badge temp-good">--.- &deg;C</div>
         </div>
@@ -259,9 +483,18 @@ HTML_DASHBOARD = """<!DOCTYPE html>
           </div>
         </div>
 
-        <div class="metric-row">
+        <!-- Sparkline CPU -->
+        <div class="sparkline-box">
+          <div class="sparkline-header">
+            <span>Histórico de CPU (Últimos 30s)</span>
+            <span id="lbl-cpu-avg">--</span>
+          </div>
+          <canvas id="canvas-cpu" class="sparkline-canvas" width="300" height="42"></canvas>
+        </div>
+
+        <div class="metric-row" style="margin-top: 14px;">
           <div class="metric-label-val">
-            <span>Mem&oacute;ria RAM</span>
+            <span>Memória RAM</span>
             <span class="metric-val" id="val-ram">--%</span>
           </div>
           <div class="progress-bar-bg">
@@ -292,16 +525,16 @@ HTML_DASHBOARD = """<!DOCTYPE html>
 
         <div style="margin-top: 14px; font-size: 12px; color: var(--text-muted); display:flex; justify-content:space-between;">
           <span>Uptime: <strong id="val-uptime" style="color:var(--text);">--</strong></span>
-          <span>Porta: <strong style="color:var(--text);">5000</strong></span>
+          <span>Porta: <strong style="color:var(--text);">5000 / 3000</strong></span>
         </div>
       </div>
 
-      <!-- Card Estacao de Campo / Sensores Externos -->
+      <!-- Card Estacao de Campo -->
       <div class="card">
         <div class="card-header">
           <div class="card-title">
             <svg width="18" height="18" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><path d="M12 2v2M12 20v2M4.93 4.93l1.41 1.41M17.66 17.66l1.41 1.41M2 12h2M20 12h2M6.34 17.66l-1.41 1.41M19.07 4.93l-1.41 1.41"/><circle cx="12" cy="12" r="4"/></svg>
-            Monitor de Campo &middot; G00001
+            Estação de Campo &middot; G00001
           </div>
           <div class="badge-status" id="station-badge" style="font-size: 11px; padding: 4px 10px;">ONLINE</div>
         </div>
@@ -316,39 +549,162 @@ HTML_DASHBOARD = """<!DOCTYPE html>
             <div class="station-tile-val" style="color: #06b6d4;" id="g-umid">--.-<span class="station-tile-unit">%</span></div>
           </div>
           <div class="station-tile">
-            <div class="station-tile-lbl">D&eacute;ficit Press&atilde;o Vapor (VPD)</div>
+            <div class="station-tile-lbl">Déficit Pressão Vapor (VPD)</div>
             <div class="station-tile-val" style="color: #10b981;" id="g-vpd">-.--<span class="station-tile-unit">kPa</span></div>
           </div>
           <div class="station-tile">
-            <div class="station-tile-lbl">Press&atilde;o Atmosf&eacute;rica</div>
+            <div class="station-tile-lbl">Pressão Atmosférica</div>
             <div class="station-tile-val" style="color: #fbbf24;" id="g-press">---.-<span class="station-tile-unit">hPa</span></div>
           </div>
         </div>
 
+        <!-- Sparkline Térmica da CPU -->
+        <div class="sparkline-box">
+          <div class="sparkline-header">
+            <span>Curva Térmica da CPU (°C últimos 30s)</span>
+            <span id="lbl-temp-avg">--</span>
+          </div>
+          <canvas id="canvas-temp" class="sparkline-canvas" width="300" height="42"></canvas>
+        </div>
+
         <div style="margin-top: 16px; padding: 12px; background: rgba(255,255,255,0.02); border-radius: 10px; font-size: 13px; display:flex; justify-content:space-between; align-items:center;">
-          <span>Origem: <strong id="g-cultura" style="color:#10b981;">Telemetria Externa</strong></span>
-          <span style="font-size: 12px; color: var(--text-muted);" id="g-ago">&Uacute;ltimo envio: h&aacute; -- seg</span>
+          <span>Cultura: <strong id="g-cultura" style="color:#10b981;">Café Arábica</strong></span>
+          <span style="font-size: 12px; color: var(--text-muted);" id="g-ago">Último envio: há -- seg</span>
+        </div>
+      </div>
+
+      <!-- Card Servicos & Docker -->
+      <div class="card">
+        <div class="card-header">
+          <div class="card-title">
+            <svg width="18" height="18" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><polygon points="12 2 2 7 12 12 22 7 12 2"></polygon><polyline points="2 17 12 22 22 17"></polyline><polyline points="2 12 12 17 22 12"></polyline></svg>
+            Serviços & Contêineres
+          </div>
+          <div class="badge-status" id="ping-badge" style="font-size: 11px; padding: 4px 10px;">Ping: ~2ms</div>
+        </div>
+
+        <div class="services-list" id="services-container">
+          <!-- Renderizado dinamicamente -->
+          <div class="service-item">
+            <div class="service-info">
+              <span class="service-name">Gaia Server</span>
+              <span class="service-sub">Porta 3000 &middot; Backend Principal</span>
+            </div>
+            <span class="service-badge srv-ok">ATIVO</span>
+          </div>
+        </div>
+
+        <div style="margin-top: 16px; padding: 12px; background: rgba(255,255,255,0.02); border-radius: 10px; font-size: 12px; color: var(--text-muted);">
+          Monitoramento de sockets TCP locais executado a cada ciclo.
         </div>
       </div>
     </div>
 
     <footer>
       <div>
-        Hardware de Bancada: <span class="tag-desk">Vigil Desk (ESP32)</span>
+        Hardware de Bancada: <span class="tag-desk">Vigil Desk (ESP32 - IP: IP_DO_VIGIL_DESK)</span>
       </div>
       <div id="last-updated">
-        Atualizado h&aacute; poucos segundos
+        Atualizado há poucos segundos
       </div>
     </footer>
   </div>
 
   <script>
+    let soundEnabled = true;
+    let audioCtx = null;
+    let lastAlertLevel = 'normal';
+
+    function toggleSound() {
+      soundEnabled = !soundEnabled;
+      const btn = document.getElementById('btn-sound');
+      if (soundEnabled) {
+        btn.innerText = '🔔 Alertas Sonoros: Ligado';
+        btn.style.color = 'var(--text)';
+        playChime(660, 880);
+      } else {
+        btn.innerText = '🔕 Alertas Sonoros: Mudo';
+        btn.style.color = 'var(--text-muted)';
+      }
+    }
+
+    function playChime(freq1, freq2) {
+      if (!soundEnabled) return;
+      try {
+        if (!audioCtx) audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+        if (audioCtx.state === 'suspended') audioCtx.resume();
+        
+        const now = audioCtx.currentTime;
+        const osc1 = audioCtx.createOscillator();
+        const osc2 = audioCtx.createOscillator();
+        const gain = audioCtx.createGain();
+
+        osc1.type = 'sine';
+        osc1.frequency.setValueAtTime(freq1, now);
+        osc2.type = 'sine';
+        osc2.frequency.setValueAtTime(freq2, now + 0.12);
+
+        gain.gain.setValueAtTime(0.12, now);
+        gain.gain.exponentialRampToValueAtTime(0.001, now + 0.35);
+
+        osc1.connect(gain);
+        osc2.connect(gain);
+        gain.connect(audioCtx.destination);
+
+        osc1.start(now);
+        osc1.stop(now + 0.12);
+        osc2.start(now + 0.12);
+        osc2.stop(now + 0.35);
+      } catch (e) {
+        console.error(e);
+      }
+    }
+
+    function drawSparkline(canvasId, data, colorStroke, colorFill, minVal, maxVal) {
+      const cvs = document.getElementById(canvasId);
+      if (!cvs || !data || data.length < 2) return;
+      const ctx = cvs.getContext('2d');
+      const w = cvs.width;
+      const h = cvs.height;
+
+      ctx.clearRect(0, 0, w, h);
+
+      const len = data.length;
+      const step = w / (len - 1);
+
+      ctx.beginPath();
+      for (let i = 0; i < len; i++) {
+        const val = data[i];
+        const norm = (val - minVal) / Math.max((maxVal - minVal), 1);
+        const y = h - Math.min(Math.max(norm * (h - 8) + 4, 4), h - 4);
+        const x = i * step;
+
+        if (i === 0) ctx.moveTo(x, y);
+        else ctx.lineTo(x, y);
+      }
+
+      ctx.strokeStyle = colorStroke;
+      ctx.lineWidth = 2;
+      ctx.stroke();
+
+      // Gradiente de preenchimento
+      ctx.lineTo(w, h);
+      ctx.lineTo(0, h);
+      ctx.closePath();
+      const grad = ctx.createLinearGradient(0, 0, 0, h);
+      grad.addColorStop(0, colorFill);
+      grad.addColorStop(1, 'rgba(0,0,0,0)');
+      ctx.fillStyle = grad;
+      ctx.fill();
+    }
+
     async function updateDashboard() {
       try {
         const res = await fetch('/api/status');
         if (!res.ok) throw new Error('Status ' + res.status);
         const data = await res.json();
         
+        // Servidor
         const s = data.server || {};
         document.getElementById('val-cpu').innerText = s.cpu.toFixed(1) + '%';
         document.getElementById('bar-cpu').style.width = Math.min(100, Math.max(0, s.cpu)) + '%';
@@ -362,17 +718,67 @@ HTML_DASHBOARD = """<!DOCTYPE html>
         document.getElementById('val-rx').innerText = (s.rx_kbps || 0).toFixed(1) + ' KB/s';
         document.getElementById('val-tx').innerText = (s.tx_kbps || 0).toFixed(1) + ' KB/s';
 
+        // Temperatura CPU
         const temp = s.cpu_temp || 0;
         const tempEl = document.getElementById('temp-badge');
         tempEl.innerHTML = (temp > 0 ? temp.toFixed(1) : '--.-') + ' &deg;C';
         tempEl.className = 'temp-badge ' + (temp > 75 ? 'temp-crit' : (temp > 60 ? 'temp-warn' : 'temp-good'));
 
+        // Uptime
         const up = s.uptime_sec || 0;
         const d = Math.floor(up / 86400);
         const h = Math.floor((up % 86400) / 3600);
         const m = Math.floor((up % 3600) / 60);
         document.getElementById('val-uptime').innerText = `${d}d ${h}h ${m}m`;
 
+        // Alertas
+        const level = s.alert_level || 'normal';
+        const banner = document.getElementById('alert-banner');
+        const alertTitle = document.getElementById('alert-title');
+        const alertDesc = document.getElementById('alert-desc');
+        const alertIcon = document.getElementById('alert-icon');
+        const alertStamp = document.getElementById('alert-stamp');
+
+        if (level === 'critical') {
+          banner.className = 'alert-banner alert-critical';
+          alertIcon.innerText = '🚨';
+          alertTitle.innerText = 'ALERTA CRÍTICO DE SISTEMA';
+          alertDesc.innerText = s.alert_msg || 'Parâmetros excederam o limite de segurança!';
+          alertStamp.innerText = 'PERIGO';
+          alertStamp.style.color = '#f87171';
+          if (lastAlertLevel !== 'critical') playChime(880, 440);
+        } else if (level === 'warning') {
+          banner.className = 'alert-banner alert-warning';
+          alertIcon.innerText = '⚠️';
+          alertTitle.innerText = 'ATENÇÃO // ELEVAÇÃO DE CARGA/TEMPERATURA';
+          alertDesc.innerText = s.alert_msg || 'Monitorando métricas anormais.';
+          alertStamp.innerText = 'ATENÇÃO';
+          alertStamp.style.color = '#fbbf24';
+          if (lastAlertLevel === 'normal') playChime(587, 880);
+        } else {
+          banner.className = 'alert-banner alert-normal';
+          alertIcon.innerText = '🛡️';
+          alertTitle.innerText = 'SISTEMA VIGIL OPERANDO NORMALMENTE';
+          alertDesc.innerText = 'Infraestrutura estável, parâmetros térmicos e telemetria sob controle.';
+          alertStamp.innerText = 'SAUDÁVEL';
+          alertStamp.style.color = '#34d399';
+        }
+        lastAlertLevel = level;
+
+        // Sparklines
+        const hist = data.history || {};
+        if (hist.cpu && hist.cpu.length > 0) {
+          drawSparkline('canvas-cpu', hist.cpu, '#06b6d4', 'rgba(6, 182, 212, 0.25)', 0, 100);
+          const lastCpu = hist.cpu[hist.cpu.length - 1];
+          document.getElementById('lbl-cpu-avg').innerText = 'Agora: ' + lastCpu.toFixed(1) + '%';
+        }
+        if (hist.temp && hist.temp.length > 0) {
+          drawSparkline('canvas-temp', hist.temp, '#fbbf24', 'rgba(251, 191, 36, 0.22)', 30, 90);
+          const lastT = hist.temp[hist.temp.length - 1];
+          document.getElementById('lbl-temp-avg').innerText = 'Agora: ' + lastT.toFixed(1) + '°C';
+        }
+
+        // Estacao
         const g = data.station || data.gaia || {};
         document.getElementById('g-temp').innerHTML = (g.temp || 0).toFixed(1) + '<span class="station-tile-unit">&deg;C</span>';
         document.getElementById('g-umid').innerHTML = (g.umid || 0).toFixed(1) + '<span class="station-tile-unit">%</span>';
@@ -384,6 +790,28 @@ HTML_DASHBOARD = """<!DOCTYPE html>
         const badge = document.getElementById('station-badge');
         badge.innerText = g.status || 'ONLINE';
         badge.style.color = (g.status === 'ONLINE') ? '#34d399' : '#f87171';
+
+        // Servicos
+        const services = data.services || [];
+        if (services.length > 0) {
+          let sHtml = '';
+          services.forEach(srv => {
+            const isOk = srv.status;
+            sHtml += `
+              <div class="service-item">
+                <div class="service-info">
+                  <span class="service-name">${srv.name}</span>
+                  <span class="service-sub">Porta ${srv.port} &middot; ${srv.type}</span>
+                </div>
+                <span class="service-badge ${isOk ? 'srv-ok' : 'srv-err'}">${isOk ? 'ATIVO' : 'OFFLINE'}</span>
+              </div>
+            `;
+          });
+          document.getElementById('services-container').innerHTML = sHtml;
+        }
+        if (data.ping_ms) {
+          document.getElementById('ping-badge').innerText = 'Ping LAN: ~' + data.ping_ms + 'ms';
+        }
 
         document.getElementById('last-updated').innerText = 'Sincronizado: ' + new Date().toLocaleTimeString();
         document.getElementById('conn-status').innerText = 'VIGIL ATIVO AO VIVO';
@@ -402,39 +830,50 @@ HTML_DASHBOARD = """<!DOCTYPE html>
 
 class MonitorHandler(BaseHTTPRequestHandler):
     def do_GET(self):
-        global last_net, last_time
-        
+        # 1. Rota JSON API: /api/status
         if self.path in ['/api/status', '/status']:
-            now = time.time()
-            dt = max(now - last_time, 0.5)
-            curr_net = psutil.net_io_counters()
-            
-            rx_kbps = round(((curr_net.bytes_recv - last_net.bytes_recv) / 1024.0) / dt, 1)
-            tx_kbps = round(((curr_net.bytes_sent - last_net.bytes_sent) / 1024.0) / dt, 1)
-            last_net = curr_net
-            last_time = now
+            with history_lock:
+                h_cpu = list(history_cpu)
+                h_temp = list(history_temp)
+                h_ram = list(history_ram)
 
-            cpu = psutil.cpu_percent(interval=None)
-            cpu_temp = get_cpu_temp()
-            ram = psutil.virtual_memory().percent
-            disk = psutil.disk_usage('/').percent
-            uptime = int(now - psutil.boot_time())
-
+            services, ping_ms = get_services_status()
             station = get_field_station_metrics()
+
+            # Mapeia servicos para facilitar no ESP32
+            srvc_map = {
+                "serverApiOk": any(s["port"] == 3000 and s["status"] for s in services),
+                "agroclimaOk": any(s["port"] == 3001 and s["status"] for s in services),
+                "postgresOk": any(s["port"] == 5432 and s["status"] for s in services),
+                "mosquittoOk": any(s["port"] == 1883 and s["status"] for s in services),
+                "pingMs": ping_ms
+            }
 
             payload = {
                 "server": {
-                    "name": "Servidor Principal",
+                    "name": "Ubuntu Server1",
                     "status": "online",
-                    "cpu": cpu,
-                    "cpu_temp": cpu_temp,
-                    "ram": ram,
-                    "disk": disk,
-                    "rx_kbps": rx_kbps,
-                    "tx_kbps": tx_kbps,
-                    "uptime_sec": uptime
+                    "cpu": current_metrics["cpu"],
+                    "cpu_temp": current_metrics["cpu_temp"],
+                    "ram": current_metrics["ram"],
+                    "disk": current_metrics["disk"],
+                    "rx_kbps": current_metrics["rx_kbps"],
+                    "tx_kbps": current_metrics["tx_kbps"],
+                    "uptime_sec": current_metrics["uptime_sec"],
+                    "alert_level": current_metrics["alert_level"],
+                    "alert_msg": current_metrics["alert_msg"],
+                    "alerts": current_metrics["alerts"]
                 },
-                "station": station
+                "services": services,
+                "services_status": srvc_map,
+                "ping_ms": ping_ms,
+                "history": {
+                    "cpu": h_cpu,
+                    "temp": h_temp,
+                    "ram": h_ram
+                },
+                "station": station,
+                "gaia": station
             }
 
             body = json.dumps(payload).encode('utf-8')
@@ -445,6 +884,7 @@ class MonitorHandler(BaseHTTPRequestHandler):
             self.end_headers()
             self.wfile.write(body)
 
+        # 2. Rota Dashboard Web HTML: / ou /dashboard
         elif self.path in ['/', '/dashboard', '/index.html']:
             body = HTML_DASHBOARD.encode('utf-8')
             self.send_response(200)
@@ -461,8 +901,11 @@ class MonitorHandler(BaseHTTPRequestHandler):
         return
 
 if __name__ == '__main__':
+    # Inicializa psutil e sampler thread
     psutil.cpu_percent(interval=None)
-    server_address = ('0.0.0.0', PORT)
+    t = threading.Thread(target=background_sampler, daemon=True)
+    t.start()
+
+    server_address = ('0.0.0.0', 5000)
     httpd = HTTPServer(server_address, MonitorHandler)
-    print(f"Sistema Vigil - Agente ativo na porta {PORT}")
     httpd.serve_forever()
