@@ -386,7 +386,7 @@ private:
 
     tft.setTextColor(ILI9341_CYAN, ILI9341_BLACK);
     tft.setCursor(20, 205);
-    tft.print("Painel Vigil: http://192.168.0.105:5000");
+    tft.print("Painel Vigil: http://IP_DO_SERVIDOR:5000");
   }
 
   void drawBar(int x, int y, int w, int h, float pct, uint16_t okColor, uint16_t alertColor) {
