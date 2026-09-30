@@ -153,14 +153,16 @@ O servidor [`server/server_agent.py`](server/server_agent.py) utiliza `Threading
 
 | Método | Rota | Descrição | Exemplo de Retorno |
 | :--- | :--- | :--- | :--- |
-| `GET` | `/` ou `/dashboard` | Interface Web *Dark Mode Glassmorphism* com gráficos em tempo real | Página HTML5 completa |
-| `GET` | `/api/status` | Payload JSON unificado (Servidor, Serviços, Histórico, Estação GAIA e Spotify) | `{"server": {...}, "spotify": {...}}` |
+| `GET` | `/` ou `/dashboard` | Interface Web *Dark Mode Glassmorphism* com NOC, DevOps Deck, Top Processos e Console de Logs | Página HTML5 completa |
+| `GET` | `/api/status` | Payload JSON unificado (Servidor, Serviços, Top 5 Processos, Histórico, Estação GAIA e Spotify) | `{"server": {...}, "top_processes": [...], "spotify": {...}}` |
+| `GET` | `/api/logs` | Stream de eventos e logs recentes do agente em memória (ring buffer) | `[{"ts":"20:30:15","type":"cmd","msg":"..."}]` |
 | `GET` | `/api/spotify/art.jpg` | Imagem da capa do álbum atual convertida para **Baseline JPEG 80x80** | Binário `image/jpeg` (~2.5 KB) |
 | `POST` / `GET` | `/api/spotify/toggle` | Alterna entre Play e Pause na conta Spotify ativa | `{"ok": true, "action": "toggle"}` |
 | `POST` / `GET` | `/api/spotify/next` | Avança para a próxima faixa no Spotify | `{"ok": true, "action": "next"}` |
 | `POST` / `GET` | `/api/spotify/prev` | Retorna para a faixa anterior no Spotify | `{"ok": true, "action": "prev"}` |
 | `POST` / `GET` | `/api/spotify/volume?val=75` | Define o volume do dispositivo Spotify ativo (`0` a `100`) | `{"ok": true, "action": "volume:75"}` |
 | `POST` / `GET` | `/api/cmd/<comando>` | Executa um comando do DevOps Command Deck (`restart_gaia`, `restart_agro`, `restart_mqtt`, `wol`, `clear_cache`, `test_tunnel`) | `{"ok": true, "command": "test_tunnel", "message": "Tunel OK (44ms)"}` |
+| `GET` | `/manifest.json` | Manifest PWA para instalação no celular / desktop como aplicativo nativo | JSON Manifest PWA |
 
 ---
 

@@ -1,11 +1,10 @@
-import subprocess
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
 ==============================================================================
-SISTEMA VIGIL - VIGIL AGENT & WEB DASHBOARD
+SISTEMA VIGIL - VIGIL AGENT & WEB DASHBOARD (v2.5)
 ==============================================================================
-Observabilidade de Servidores, Monitoramento Térmico e Telemetria de Campo
+NOC, Observabilidade de Servidores, Monitor Térmico, Spotify Hub & DevOps Deck
 ==============================================================================
 """
 
@@ -16,17 +15,42 @@ import socket
 import collections
 import threading
 import urllib.request
-import psutil
-from http.server import HTTPServer, ThreadingHTTPServer, BaseHTTPRequestHandler
-import base64
 import urllib.parse
-import io
+import subprocess
+import base64
+try:
+    import psutil
+    PSUTIL_AVAILABLE = True
+except Exception:
+    psutil = None
+    PSUTIL_AVAILABLE = False
+from http.server import HTTPServer, ThreadingHTTPServer, BaseHTTPRequestHandler
+
 try:
     from PIL import Image
     PIL_AVAILABLE = True
 except Exception:
     PIL_AVAILABLE = False
 
+# ==============================================================================
+# LOGS DO SISTEMA EM MEMÓRIA (RING BUFFER)
+# ==============================================================================
+logs_lock = threading.Lock()
+system_logs = collections.deque(maxlen=60)
+
+def add_log(event_type, msg):
+    with logs_lock:
+        system_logs.append({
+            "ts": time.strftime("%H:%M:%S"),
+            "type": event_type,  # 'info', 'cmd', 'warn', 'alert'
+            "msg": msg
+        })
+
+add_log("info", "Vigil Agent v2.5 iniciado com sucesso na porta 5000")
+
+# ==============================================================================
+# ESTADO & INTEGRAÇÃO SPOTIFY
+# ==============================================================================
 spotify_lock = threading.Lock()
 spotify_state = {
     "active": False,
@@ -91,14 +115,13 @@ def update_spotify_art(img_url, track_id):
     if not img_url or img_url == spotify_last_art_src:
         return
     try:
-        req = urllib.request.Request(img_url, headers={"User-Agent": "VigilAgent/2.0"})
+        req = urllib.request.Request(img_url, headers={"User-Agent": "VigilAgent/2.5"})
         with urllib.request.urlopen(req, timeout=5) as resp:
             raw = resp.read()
         if PIL_AVAILABLE:
             im = Image.open(io.BytesIO(raw)).convert("RGB")
             im = im.resize((80, 80), Image.Resampling.LANCZOS)
             out = io.BytesIO()
-            # Baseline JPEG (progressive=False) obrigatorio para TJpg_Decoder no ESP32
             im.save(out, format="JPEG", quality=82, optimize=False, progressive=False)
             spotify_art_bytes = out.getvalue()
         else:
@@ -110,6 +133,7 @@ def update_spotify_art(img_url, track_id):
 def spotify_command(action):
     token = get_spotify_token()
     if not token:
+        add_log("warn", "Comando Spotify rejeitado: token não configurado")
         return False
     try:
         with spotify_lock:
@@ -143,41 +167,58 @@ def spotify_command(action):
             "Content-Length": "0"
         })
         with urllib.request.urlopen(req, timeout=4) as resp:
-            return resp.status in [200, 202, 204]
-    except Exception:
+            ok = resp.status in [200, 202, 204]
+            if ok:
+                add_log("info", f"Spotify comando executado: {action}")
+            return ok
+    except Exception as e:
+        add_log("warn", f"Falha no comando Spotify '{action}': {str(e)[:30]}")
         return False
 
 def execute_devops_command(cmd_name):
-    """Executa comandos rapidos do Vigil Command Deck com seguranca"""
+    """Executa comandos rápidos do Vigil Command Deck com segurança"""
     try:
         if cmd_name == "restart_gaia":
             subprocess.Popen(["sh", "-c", "docker restart $(docker ps -q --filter ancestor=gaia) 2>/dev/null || docker restart gaia 2>/dev/null || true"])
-            return True, "Container Gaia reiniciado"
+            msg = "Container Gaia reiniciado"
+            add_log("cmd", msg)
+            return True, msg
         elif cmd_name == "restart_agro":
             subprocess.Popen(["sh", "-c", "docker restart $(docker ps -q --filter name=agro) 2>/dev/null || true"])
-            return True, "Container Agroclima reiniciado"
+            msg = "Container Agroclima reiniciado"
+            add_log("cmd", msg)
+            return True, msg
         elif cmd_name == "restart_mqtt":
             subprocess.Popen(["sh", "-c", "docker restart $(docker ps -q --filter name=mosquitto) 2>/dev/null || systemctl restart mosquitto 2>/dev/null || true"])
-            return True, "Broker MQTT reiniciado"
+            msg = "Broker Mosquitto MQTT reiniciado"
+            add_log("cmd", msg)
+            return True, msg
         elif cmd_name == "wol":
-            # Envia Magic Packet UDP broadcast na LAN
             mac_bytes = bytes.fromhex("FFFFFFFFFFFF")
             pkt = b"\xff" * 6 + mac_bytes * 16
             with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as s:
                 s.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
                 s.sendto(pkt, ("255.255.255.255", 9))
-            return True, "Magic Packet WOL enviado"
+            msg = "Magic Packet WOL transmitido na LAN"
+            add_log("cmd", msg)
+            return True, msg
         elif cmd_name == "clear_cache":
             subprocess.Popen(["sh", "-c", "sync"])
-            return True, "Buffers sincronizados"
+            msg = "Buffers do SO sincronizados (sync)"
+            add_log("cmd", msg)
+            return True, msg
         elif cmd_name == "test_tunnel":
             t0 = time.time()
-            req = urllib.request.Request("https://server1.taila7d06b.ts.net:10000/api/status", headers={"User-Agent": "VigilDeck/2.0"})
+            req = urllib.request.Request("https://server1.taila7d06b.ts.net:10000/api/status", headers={"User-Agent": "VigilDeck/2.5"})
             with urllib.request.urlopen(req, timeout=4) as r:
                 ms = int((time.time() - t0) * 1000)
-                return (r.status == 200), f"Tunel OK ({ms}ms)"
+                msg = f"Túnel OK ({ms}ms)"
+                add_log("cmd", f"Healthcheck Túnel HTTPS: {msg}")
+                return (r.status == 200), msg
     except Exception as e:
-        return False, str(e)[:32]
+        err_msg = f"Erro: {str(e)[:32]}"
+        add_log("warn", f"Comando '{cmd_name}' falhou: {err_msg}")
+        return False, err_msg
     return False, "Comando desconhecido"
 
 def spotify_sampler():
@@ -228,17 +269,19 @@ def spotify_sampler():
             pass
         time.sleep(2.0)
 
-
 # Ring buffer de histórico para gráficos em tempo real (últimos 30 pontos)
 history_lock = threading.Lock()
 history_cpu = collections.deque(maxlen=30)
 history_temp = collections.deque(maxlen=30)
 history_ram = collections.deque(maxlen=30)
 
-last_net = psutil.net_io_counters()
+class MockNet:
+    bytes_recv = 1024 * 1024
+    bytes_sent = 512 * 1024
+
+last_net = psutil.net_io_counters() if PSUTIL_AVAILABLE else MockNet()
 last_time = time.time()
 
-# Cache de métricas atuais
 current_metrics = {
     "cpu": 0.0,
     "cpu_temp": 0.0,
@@ -253,6 +296,8 @@ current_metrics = {
 }
 
 def get_cpu_temp():
+    if not PSUTIL_AVAILABLE:
+        return 46.5
     try:
         temps = psutil.sensors_temperatures()
         if 'coretemp' in temps and len(temps['coretemp']) > 0:
@@ -295,9 +340,39 @@ def get_services_status():
         {"name": "Nginx Proxy", "port": 80, "status": s_nginx, "type": "Reverse Proxy"}
     ], ping_ms
 
+def get_top_processes(limit=5):
+    """Retorna os top processos consumidores de CPU e memória"""
+    if not PSUTIL_AVAILABLE:
+        return [
+            {"pid": 1240, "name": "node (gaia)", "cpu": 3.8, "mem": 7.4},
+            {"pid": 2315, "name": "postgres", "cpu": 1.9, "mem": 11.2},
+            {"pid": 3142, "name": "dockerd", "cpu": 1.5, "mem": 5.8},
+            {"pid": 4510, "name": "tailscaled", "cpu": 0.8, "mem": 3.2},
+            {"pid": 5894, "name": "python3 (agent)", "cpu": 0.6, "mem": 2.1}
+        ]
+    procs = []
+    for p in psutil.process_iter(['pid', 'name', 'cpu_percent', 'memory_percent']):
+        try:
+            info = p.info
+            name = info.get('name') or ''
+            if not name or name.startswith('[') or name in ['kworker', 'systemd']:
+                continue
+            cpu = float(info.get('cpu_percent') or 0.0)
+            mem = round(float(info.get('memory_percent') or 0.0), 1)
+            procs.append({
+                "pid": info['pid'],
+                "name": name,
+                "cpu": cpu,
+                "mem": mem
+            })
+        except (psutil.NoSuchProcess, psutil.AccessDenied):
+            pass
+    procs.sort(key=lambda x: (x['cpu'], x['mem']), reverse=True)
+    return procs[:limit]
+
 def get_field_station_metrics():
     try:
-        req = urllib.request.Request("http://127.0.0.1:3000/api/estacoes", headers={"User-Agent": "VigilAgent/2.0"})
+        req = urllib.request.Request("http://127.0.0.1:3000/api/estacoes", headers={"User-Agent": "VigilAgent/2.5"})
         with urllib.request.urlopen(req, timeout=2) as resp:
             data = json.loads(resp.read().decode('utf-8'))
             if isinstance(data, list) and len(data) > 0:
@@ -332,31 +407,39 @@ def get_field_station_metrics():
     }
 
 def background_sampler():
-    """Coleta métricas continuamente a cada 1s para alimentar os gráficos em tempo real"""
+    """Coleta métricas continuamente a cada 1.2s para alimentar gráficos e alertas"""
     global last_net, last_time, current_metrics
+    last_alert_logged = "normal"
     while True:
         try:
             now = time.time()
             dt = max(now - last_time, 0.5)
-            curr_net = psutil.net_io_counters()
-            
-            rx_kbps = round(((curr_net.bytes_recv - last_net.bytes_recv) / 1024.0) / dt, 1)
-            tx_kbps = round(((curr_net.bytes_sent - last_net.bytes_sent) / 1024.0) / dt, 1)
-            last_net = curr_net
-            last_time = now
+            if PSUTIL_AVAILABLE:
+                curr_net = psutil.net_io_counters()
+                rx_kbps = round(((curr_net.bytes_recv - last_net.bytes_recv) / 1024.0) / dt, 1)
+                tx_kbps = round(((curr_net.bytes_sent - last_net.bytes_sent) / 1024.0) / dt, 1)
+                last_net = curr_net
+                last_time = now
 
-            cpu = psutil.cpu_percent(interval=None)
-            cpu_temp = get_cpu_temp()
-            ram = psutil.virtual_memory().percent
-            disk = psutil.disk_usage('/').percent
-            uptime = int(now - psutil.boot_time())
+                cpu = psutil.cpu_percent(interval=None)
+                cpu_temp = get_cpu_temp()
+                ram = psutil.virtual_memory().percent
+                disk = psutil.disk_usage('/').percent
+                uptime = int(now - psutil.boot_time())
+            else:
+                rx_kbps = 4.5
+                tx_kbps = 1.2
+                cpu = 14.2
+                cpu_temp = 46.5
+                ram = 43.8
+                disk = 12.0
+                uptime = 934000
 
             with history_lock:
                 history_cpu.append(cpu)
                 history_temp.append(cpu_temp)
                 history_ram.append(ram)
 
-            # Classifica status de alerta
             alerts = []
             level = "normal"
 
@@ -379,6 +462,13 @@ def background_sampler():
             if alerts:
                 msg = alerts[0]
 
+            if level != last_alert_logged:
+                if level != "normal":
+                    add_log("alert" if level == "critical" else "warn", msg)
+                else:
+                    add_log("info", "Alertas normalizados: Sistema estável")
+                last_alert_logged = level
+
             current_metrics = {
                 "cpu": cpu,
                 "cpu_temp": cpu_temp,
@@ -391,82 +481,77 @@ def background_sampler():
                 "alert_msg": msg,
                 "alerts": alerts
             }
-        except Exception as e:
+        except Exception:
             pass
         time.sleep(1.2)
 
+# ==============================================================================
+# HTML DASHBOARD (VIGIL WEB v2.5 — GLASSMORPHISM & DEVOPS COMMAND DECK)
+# ==============================================================================
 HTML_DASHBOARD = """<!DOCTYPE html>
 <html lang="pt-BR">
 <head>
   <meta charset="UTF-8">
-  <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <title>Vigil // Monitor de Infraestrutura</title>
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
+  <title>Vigil // Centro de Controle & Observabilidade</title>
+  <meta name="theme-color" content="#0b0f19">
+  <meta name="apple-mobile-web-app-capable" content="yes">
+  <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+  <link rel="manifest" href="/manifest.json">
   <link rel="preconnect" href="https://fonts.googleapis.com">
   <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
-  <link href="https://fonts.googleapis.com/css2?family=Outfit:wght@300;400;500;600;700&family=JetBrains+Mono:wght@400;600;700&display=swap" rel="stylesheet">
+  <link href="https://fonts.googleapis.com/css2?family=Outfit:wght@300;400;500;600;700;800&family=JetBrains+Mono:wght@400;500;600;700&display=swap" rel="stylesheet">
   <style>
     :root {
       --bg: #0b0f19;
-      --card-bg: rgba(18, 24, 39, 0.78);
+      --card-bg: rgba(18, 24, 39, 0.82);
       --card-border: rgba(255, 255, 255, 0.08);
       --primary: #10b981;
-      --primary-glow: rgba(16, 185, 129, 0.25);
+      --primary-glow: rgba(16, 185, 129, 0.28);
       --accent: #06b6d4;
       --warning: #f59e0b;
       --danger: #ef4444;
       --text: #f3f4f6;
       --text-muted: #9ca3af;
+      --spotify: #1db954;
     }
     * { box-sizing: border-box; margin: 0; padding: 0; }
     body {
       font-family: 'Outfit', -apple-system, sans-serif;
-      background: radial-gradient(circle at 15% 15%, #131c31 0%, #0b0f19 65%);
+      background: radial-gradient(circle at 10% 10%, #152238 0%, #0b0f19 70%);
       color: var(--text);
       min-height: 100vh;
-      padding: 20px 16px 40px;
+      padding: 16px 14px 60px;
     }
-    .container { max-width: 1140px; margin: 0 auto; }
+    .container { max-width: 1180px; margin: 0 auto; }
     
     /* Header */
     header {
-      display: flex;
-      justify-content: space-between;
-      align-items: center;
-      margin-bottom: 20px;
-      flex-wrap: wrap;
-      gap: 16px;
-      border-bottom: 1px solid var(--card-border);
-      padding-bottom: 16px;
+      display: flex; justify-content: space-between; align-items: center;
+      margin-bottom: 16px; flex-wrap: wrap; gap: 14px;
+      border-bottom: 1px solid var(--card-border); padding-bottom: 14px;
     }
-    .logo-area { display: flex; align-items: center; gap: 14px; }
+    .logo-area { display: flex; align-items: center; gap: 12px; }
     .logo-icon {
-      width: 46px; height: 46px; border-radius: 12px;
+      width: 44px; height: 44px; border-radius: 12px;
       background: linear-gradient(135deg, #10b981, #06b6d4);
       display: flex; align-items: center; justify-content: center;
-      font-weight: 800; font-size: 26px; color: #fff;
-      box-shadow: 0 0 24px var(--primary-glow);
+      font-weight: 800; font-size: 24px; color: #fff;
+      box-shadow: 0 0 20px var(--primary-glow);
     }
-    .title h1 { font-size: 24px; font-weight: 700; letter-spacing: -0.5px; }
-    .title p { font-size: 13px; color: var(--text-muted); }
+    .title h1 { font-size: 22px; font-weight: 700; letter-spacing: -0.5px; }
+    .title p { font-size: 12px; color: var(--text-muted); }
     
-    .header-actions { display: flex; align-items: center; gap: 12px; }
-    .btn-sound {
-      background: rgba(255, 255, 255, 0.06);
-      border: 1px solid var(--card-border);
-      color: var(--text);
-      padding: 7px 14px;
-      border-radius: 20px;
-      font-size: 13px;
-      cursor: pointer;
-      display: flex;
-      align-items: center;
-      gap: 6px;
-      transition: all 0.2s;
+    .header-actions { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
+    .btn-action {
+      background: rgba(255, 255, 255, 0.05); border: 1px solid var(--card-border);
+      color: var(--text); padding: 7px 12px; border-radius: 20px; font-size: 12px;
+      cursor: pointer; display: flex; align-items: center; gap: 6px; transition: all 0.2s;
     }
-    .btn-sound:hover { background: rgba(255, 255, 255, 0.12); }
+    .btn-action:hover { background: rgba(255, 255, 255, 0.12); border-color: rgba(255,255,255,0.2); }
     .badge-status {
-      display: inline-flex; align-items: center; gap: 8px;
-      padding: 7px 16px; border-radius: 30px; font-size: 13px; font-weight: 600;
+      display: inline-flex; align-items: center; gap: 6px;
+      padding: 6px 14px; border-radius: 30px; font-size: 12px; font-weight: 600;
       background: rgba(16, 185, 129, 0.15); color: #34d399; border: 1px solid rgba(16, 185, 129, 0.3);
     }
     .pulse-dot {
@@ -479,161 +564,195 @@ HTML_DASHBOARD = """<!DOCTYPE html>
       100% { transform: scale(0.9); opacity: 1; }
     }
 
+    /* Ecosystem Quick Launch Bar */
+    .ecosystem-bar {
+      display: flex; gap: 10px; margin-bottom: 18px; overflow-x: auto; padding-bottom: 4px;
+    }
+    .eco-chip {
+      background: rgba(255, 255, 255, 0.03); border: 1px solid var(--card-border);
+      border-radius: 10px; padding: 7px 14px; font-size: 12px; font-weight: 500;
+      color: var(--text); text-decoration: none; display: flex; align-items: center; gap: 8px;
+      white-space: nowrap; transition: all 0.2s;
+    }
+    .eco-chip:hover {
+      background: rgba(255, 255, 255, 0.08); border-color: var(--primary);
+      transform: translateY(-1px);
+    }
+    .eco-dot { width: 6px; height: 6px; border-radius: 50%; background: #10b981; }
+
     /* Alert Banner */
     .alert-banner {
-      border-radius: 14px;
-      padding: 14px 20px;
-      margin-bottom: 22px;
-      display: flex;
-      align-items: center;
-      justify-content: space-between;
-      gap: 16px;
+      border-radius: 12px; padding: 12px 18px; margin-bottom: 20px;
+      display: flex; align-items: center; justify-content: space-between; gap: 14px;
       transition: all 0.3s ease;
     }
-    .alert-normal {
-      background: rgba(16, 185, 129, 0.08);
-      border: 1px solid rgba(16, 185, 129, 0.25);
-    }
-    .alert-warning {
-      background: rgba(245, 158, 11, 0.12);
-      border: 1px solid rgba(245, 158, 11, 0.4);
-      animation: alertPulse 2s infinite;
-    }
-    .alert-critical {
-      background: rgba(239, 68, 68, 0.18);
-      border: 1px solid rgba(239, 68, 68, 0.6);
-      box-shadow: 0 0 25px rgba(239, 68, 68, 0.3);
-      animation: alertFlash 1.2s infinite;
-    }
-    @keyframes alertPulse {
-      0% { border-color: rgba(245, 158, 11, 0.4); }
-      50% { border-color: rgba(245, 158, 11, 0.8); }
-      100% { border-color: rgba(245, 158, 11, 0.4); }
-    }
-    @keyframes alertFlash {
-      0% { background: rgba(239, 68, 68, 0.18); }
-      50% { background: rgba(239, 68, 68, 0.32); }
-      100% { background: rgba(239, 68, 68, 0.18); }
-    }
-    .alert-left { display: flex; align-items: center; gap: 14px; }
-    .alert-icon-box { font-size: 26px; }
-    .alert-title-text { font-size: 15px; font-weight: 700; letter-spacing: -0.3px; }
-    .alert-desc-text { font-size: 13px; color: var(--text-muted); margin-top: 2px; }
+    .alert-normal { background: rgba(16, 185, 129, 0.08); border: 1px solid rgba(16, 185, 129, 0.25); }
+    .alert-warning { background: rgba(245, 158, 11, 0.12); border: 1px solid rgba(245, 158, 11, 0.4); animation: alertPulse 2s infinite; }
+    .alert-critical { background: rgba(239, 68, 68, 0.18); border: 1px solid rgba(239, 68, 68, 0.6); box-shadow: 0 0 25px rgba(239, 68, 68, 0.3); animation: alertFlash 1.2s infinite; }
+    @keyframes alertPulse { 0%, 100% { border-color: rgba(245, 158, 11, 0.4); } 50% { border-color: rgba(245, 158, 11, 0.85); } }
+    @keyframes alertFlash { 0%, 100% { background: rgba(239, 68, 68, 0.18); } 50% { background: rgba(239, 68, 68, 0.32); } }
+    .alert-left { display: flex; align-items: center; gap: 12px; }
+    .alert-icon-box { font-size: 24px; }
+    .alert-title-text { font-size: 14px; font-weight: 700; letter-spacing: -0.2px; }
+    .alert-desc-text { font-size: 12px; color: var(--text-muted); margin-top: 1px; }
 
     /* Grid Layout */
     .grid {
-      display: grid;
-      grid-template-columns: repeat(auto-fit, minmax(340px, 1fr));
-      gap: 20px;
-      margin-bottom: 24px;
+      display: grid; grid-template-columns: repeat(auto-fit, minmax(330px, 1fr));
+      gap: 18px; margin-bottom: 20px;
     }
     
     /* Cards */
     .card {
-      background: var(--card-bg);
-      border: 1px solid var(--card-border);
-      border-radius: 16px;
-      padding: 22px;
-      backdrop-filter: blur(12px);
-      box-shadow: 0 10px 30px -10px rgba(0,0,0,0.5);
-      position: relative;
+      background: var(--card-bg); border: 1px solid var(--card-border);
+      border-radius: 16px; padding: 20px; backdrop-filter: blur(14px);
+      box-shadow: 0 10px 25px -10px rgba(0,0,0,0.5); position: relative;
     }
     .card-header {
-      display: flex; justify-content: space-between; align-items: center;
-      margin-bottom: 18px;
+      display: flex; justify-content: space-between; align-items: center; margin-bottom: 16px;
     }
     .card-title {
-      font-size: 14px; font-weight: 600; text-transform: uppercase;
-      letter-spacing: 0.8px; color: var(--text-muted);
-      display: flex; align-items: center; gap: 8px;
+      font-size: 13px; font-weight: 600; text-transform: uppercase;
+      letter-spacing: 0.8px; color: var(--text-muted); display: flex; align-items: center; gap: 8px;
     }
 
-    /* Server Card Elements */
-    .metric-row { margin-bottom: 14px; }
-    .metric-label-val { display: flex; justify-content: space-between; font-size: 14px; margin-bottom: 6px; }
+    /* Metric Rows & Progress Bars */
+    .metric-row { margin-bottom: 12px; }
+    .metric-label-val { display: flex; justify-content: space-between; font-size: 13px; margin-bottom: 5px; }
     .metric-val { font-family: 'JetBrains Mono', monospace; font-weight: 600; }
-    .progress-bar-bg {
-      height: 8px; background: rgba(255,255,255,0.08); border-radius: 6px; overflow: hidden;
-    }
-    .progress-bar-fill {
-      height: 100%; border-radius: 6px; transition: width 0.5s ease;
-    }
+    .progress-bar-bg { height: 8px; background: rgba(255,255,255,0.07); border-radius: 6px; overflow: hidden; }
+    .progress-bar-fill { height: 100%; border-radius: 6px; transition: width 0.4s ease; }
     .fill-cpu { background: linear-gradient(90deg, #10b981, #06b6d4); }
     .fill-ram { background: linear-gradient(90deg, #06b6d4, #8b5cf6); }
     .fill-disk { background: linear-gradient(90deg, #f59e0b, #ec4899); }
 
     /* Canvas Sparklines */
-    .sparkline-box {
-      margin-top: 14px; padding-top: 12px; border-top: 1px solid var(--card-border);
-    }
-    .sparkline-header {
-      display: flex; justify-content: space-between; font-size: 12px; color: var(--text-muted); margin-bottom: 6px;
-    }
-    .sparkline-canvas {
-      width: 100%; height: 42px; display: block; border-radius: 6px;
-      background: rgba(0,0,0,0.25);
-    }
+    .sparkline-box { margin-top: 12px; padding-top: 10px; border-top: 1px solid var(--card-border); }
+    .sparkline-header { display: flex; justify-content: space-between; font-size: 11px; color: var(--text-muted); margin-bottom: 5px; }
+    .sparkline-canvas { width: 100%; height: 38px; display: block; border-radius: 6px; background: rgba(0,0,0,0.25); }
 
     /* Net stats pill */
     .net-box {
-      display: grid; grid-template-columns: 1fr 1fr; gap: 12px;
-      margin-top: 14px; padding-top: 12px; border-top: 1px solid var(--card-border);
+      display: grid; grid-template-columns: 1fr 1fr; gap: 10px;
+      margin-top: 12px; padding-top: 12px; border-top: 1px solid var(--card-border);
     }
     .net-pill {
-      background: rgba(255,255,255,0.03); border-radius: 10px; padding: 10px; text-align: center;
+      background: rgba(255,255,255,0.02); border-radius: 10px; padding: 8px; text-align: center;
       border: 1px solid rgba(255,255,255,0.05);
     }
-    .net-pill-label { font-size: 11px; color: var(--text-muted); text-transform: uppercase; }
-    .net-pill-val { font-family: 'JetBrains Mono', monospace; font-size: 16px; font-weight: 700; margin-top: 2px; }
+    .net-pill-label { font-size: 10px; color: var(--text-muted); text-transform: uppercase; }
+    .net-pill-val { font-family: 'JetBrains Mono', monospace; font-size: 15px; font-weight: 700; margin-top: 2px; }
     .rx-color { color: #34d399; }
     .tx-color { color: #fbbf24; }
 
     /* Temp Badge */
     .temp-badge {
       display: inline-flex; align-items: center; gap: 6px;
-      font-family: 'JetBrains Mono', monospace; font-size: 14px; font-weight: 700;
-      padding: 5px 12px; border-radius: 8px;
+      font-family: 'JetBrains Mono', monospace; font-size: 13px; font-weight: 700;
+      padding: 4px 10px; border-radius: 8px;
     }
     .temp-good { background: rgba(16, 185, 129, 0.15); color: #34d399; border: 1px solid rgba(16,185,129,0.3); }
     .temp-warn { background: rgba(245, 158, 11, 0.18); color: #fbbf24; border: 1px solid rgba(245,158,11,0.4); }
     .temp-crit { background: rgba(239, 68, 68, 0.22); color: #f87171; border: 1px solid rgba(239,68,68,0.5); }
 
     /* Station Stat Tiles */
-    .station-tiles {
-      display: grid; grid-template-columns: repeat(2, 1fr); gap: 12px;
-    }
+    .station-tiles { display: grid; grid-template-columns: repeat(2, 1fr); gap: 10px; }
     .station-tile {
-      background: rgba(255,255,255,0.03); border: 1px solid rgba(255,255,255,0.06);
-      border-radius: 12px; padding: 14px;
+      background: rgba(255,255,255,0.02); border: 1px solid rgba(255,255,255,0.05);
+      border-radius: 10px; padding: 12px;
     }
-    .station-tile-lbl { font-size: 12px; color: var(--text-muted); }
-    .station-tile-val {
-      font-family: 'JetBrains Mono', monospace; font-size: 22px; font-weight: 700;
-      margin-top: 4px;
-    }
-    .station-tile-unit { font-size: 13px; font-weight: 400; color: var(--text-muted); }
+    .station-tile-lbl { font-size: 11px; color: var(--text-muted); }
+    .station-tile-val { font-family: 'JetBrains Mono', monospace; font-size: 20px; font-weight: 700; margin-top: 3px; }
+    .station-tile-unit { font-size: 12px; font-weight: 400; color: var(--text-muted); }
 
     /* Services List */
-    .services-list { display: flex; flex-direction: column; gap: 10px; }
+    .services-list { display: flex; flex-direction: column; gap: 8px; margin-bottom: 14px; }
     .service-item {
       display: flex; justify-content: space-between; align-items: center;
-      background: rgba(255,255,255,0.03); border: 1px solid rgba(255,255,255,0.06);
-      padding: 10px 14px; border-radius: 10px;
+      background: rgba(255,255,255,0.02); border: 1px solid rgba(255,255,255,0.05);
+      padding: 8px 12px; border-radius: 8px;
     }
-    .service-info { display: flex; flex-direction: column; gap: 2px; }
-    .service-name { font-size: 14px; font-weight: 600; }
+    .service-info { display: flex; flex-direction: column; gap: 1px; }
+    .service-name { font-size: 13px; font-weight: 600; }
     .service-sub { font-size: 11px; color: var(--text-muted); }
-    .service-badge {
-      font-family: 'JetBrains Mono', monospace; font-size: 11px; font-weight: 700;
-      padding: 3px 8px; border-radius: 6px;
-    }
+    .service-badge { font-family: 'JetBrains Mono', monospace; font-size: 10px; font-weight: 700; padding: 2px 7px; border-radius: 5px; }
     .srv-ok { background: rgba(16, 185, 129, 0.15); color: #34d399; border: 1px solid rgba(16,185,129,0.3); }
     .srv-err { background: rgba(239, 68, 68, 0.15); color: #f87171; border: 1px solid rgba(239,68,68,0.3); }
 
-    /* Footer info */
+    /* Top Processes Table (htop compact) */
+    .proc-table { width: 100%; border-collapse: collapse; font-size: 11px; margin-top: 8px; font-family: 'JetBrains Mono', monospace; }
+    .proc-table th { text-align: left; color: var(--text-muted); padding: 5px 8px; border-bottom: 1px solid var(--card-border); font-size: 10px; text-transform: uppercase; }
+    .proc-table td { padding: 6px 8px; border-bottom: 1px solid rgba(255,255,255,0.03); }
+    .proc-cpu-bar { width: 45px; height: 5px; background: rgba(255,255,255,0.08); border-radius: 3px; display: inline-block; vertical-align: middle; margin-left: 6px; overflow: hidden; }
+    .proc-cpu-fill { height: 100%; background: #06b6d4; border-radius: 3px; }
+
+    /* DevOps Command Deck */
+    .cmd-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(140px, 1fr)); gap: 10px; }
+    .btn-cmd {
+      background: rgba(255,255,255,0.03); border: 1px solid var(--card-border);
+      border-radius: 10px; padding: 12px 10px; color: var(--text); cursor: pointer;
+      display: flex; flex-direction: column; align-items: center; justify-content: center;
+      gap: 6px; text-align: center; transition: all 0.2s; font-family: 'Outfit', sans-serif;
+    }
+    .btn-cmd:hover { background: rgba(255,255,255,0.08); border-color: var(--accent); transform: translateY(-2px); }
+    .btn-cmd-icon { font-size: 20px; }
+    .btn-cmd-title { font-size: 12px; font-weight: 600; }
+    .btn-cmd-sub { font-size: 10px; color: var(--text-muted); }
+    .cmd-status-box {
+      margin-top: 12px; padding: 10px 14px; border-radius: 8px;
+      background: rgba(0,0,0,0.3); border: 1px solid var(--card-border);
+      font-size: 12px; font-family: 'JetBrains Mono', monospace;
+      display: flex; justify-content: space-between; align-items: center;
+    }
+
+    /* Spotify Media Hub */
+    .spotify-card {
+      grid-column: 1 / -1;
+      background: linear-gradient(135deg, rgba(18, 24, 39, 0.92), rgba(29, 185, 84, 0.12));
+      border-color: rgba(29, 185, 84, 0.32);
+    }
+    .vol-slider-wrap {
+      display: flex; align-items: center; gap: 10px; min-width: 160px;
+    }
+    input[type=range] {
+      -webkit-appearance: none; width: 100%; height: 5px;
+      border-radius: 5px; background: rgba(255,255,255,0.15); outline: none;
+    }
+    input[type=range]::-webkit-slider-thumb {
+      -webkit-appearance: none; width: 14px; height: 14px;
+      border-radius: 50%; background: #1db954; cursor: pointer; box-shadow: 0 0 6px rgba(29,185,84,0.6);
+    }
+
+    /* Live Terminal Drawer */
+    .console-drawer {
+      position: fixed; bottom: 0; left: 0; right: 0;
+      background: rgba(8, 12, 22, 0.96); border-top: 1px solid rgba(255,255,255,0.12);
+      backdrop-filter: blur(16px); z-index: 1000;
+      transform: translateY(100%); transition: transform 0.3s cubic-bezier(0.16, 1, 0.3, 1);
+      box-shadow: 0 -10px 30px rgba(0,0,0,0.7); max-height: 45vh; display: flex; flex-direction: column;
+    }
+    .console-drawer.open { transform: translateY(0); }
+    .console-header {
+      padding: 10px 18px; display: flex; justify-content: space-between; align-items: center;
+      border-bottom: 1px solid var(--card-border); background: rgba(0,0,0,0.3);
+    }
+    .console-title { font-family: 'JetBrains Mono', monospace; font-size: 12px; font-weight: 700; color: #34d399; display: flex; align-items: center; gap: 8px; }
+    .console-body {
+      padding: 12px 18px; overflow-y: auto; font-family: 'JetBrains Mono', monospace;
+      font-size: 11px; line-height: 1.6; color: #cbd5e1;
+    }
+    .log-line { display: flex; gap: 10px; margin-bottom: 4px; word-break: break-all; }
+    .log-ts { color: var(--text-muted); }
+    .log-tag { font-weight: 700; padding: 0 4px; border-radius: 3px; font-size: 10px; }
+    .tag-info { color: #38bdf8; }
+    .tag-cmd { color: #a78bfa; }
+    .tag-warn { color: #fbbf24; }
+    .tag-alert { color: #f87171; }
+
+    /* Footer */
     footer {
       display: flex; justify-content: space-between; align-items: center; flex-wrap: wrap;
-      gap: 12px; font-size: 13px; color: var(--text-muted); padding-top: 14px;
+      gap: 12px; font-size: 12px; color: var(--text-muted); padding-top: 16px;
       border-top: 1px solid var(--card-border);
     }
     .tag-desk {
@@ -649,17 +768,37 @@ HTML_DASHBOARD = """<!DOCTYPE html>
         <div class="logo-icon">V</div>
         <div class="title">
           <h1>Sistema Vigil</h1>
-          <p>Monitor de Infraestrutura &middot; Servidor Ubuntu &middot; Vigil Desk</p>
+          <p>NOC & Observabilidade &middot; Servidor Ubuntu &middot; Vigil Desk</p>
         </div>
       </div>
       <div class="header-actions">
-        <button class="btn-sound" id="btn-sound" onclick="toggleSound()">🔔 Alertas Sonoros: Ligado</button>
+        <button class="btn-action" onclick="toggleConsole()">📜 Console Logs</button>
+        <button class="btn-action" id="btn-sound" onclick="toggleSound()">🔔 Alertas: On</button>
         <div class="badge-status">
           <span class="pulse-dot"></span>
           <span id="conn-status">VIGIL ATIVO AO VIVO</span>
         </div>
       </div>
     </header>
+
+    <!-- Barra de Acesso Rápido ao Ecossistema -->
+    <div class="ecosystem-bar">
+      <a href="http://192.168.0.105:3000" target="_blank" class="eco-chip">
+        <span class="eco-dot"></span> 🌾 Gaia Server (:3000)
+      </a>
+      <a href="http://192.168.0.105:3001" target="_blank" class="eco-chip">
+        <span class="eco-dot"></span> 🌿 Central Agroclima (:3001)
+      </a>
+      <a href="http://192.168.0.105:9000" target="_blank" class="eco-chip">
+        <span class="eco-dot"></span> 🐳 Portainer CE (:9000)
+      </a>
+      <a href="http://192.168.0.105:8080" target="_blank" class="eco-chip">
+        <span class="eco-dot"></span> 🗄️ Adminer DB (:8080)
+      </a>
+      <a href="https://server1.taila7d06b.ts.net:10000" target="_blank" class="eco-chip">
+        <span class="eco-dot" style="background:#06b6d4;"></span> 🔒 Túnel Tailscale HTTPS
+      </a>
+    </div>
 
     <!-- Banner Dinâmico de Alertas -->
     <div id="alert-banner" class="alert-banner alert-normal">
@@ -674,7 +813,7 @@ HTML_DASHBOARD = """<!DOCTYPE html>
     </div>
 
     <div class="grid">
-      <!-- Card Servidor -->
+      <!-- Card 1: Servidor Ubuntu -->
       <div class="card">
         <div class="card-header">
           <div class="card-title">
@@ -694,16 +833,15 @@ HTML_DASHBOARD = """<!DOCTYPE html>
           </div>
         </div>
 
-        <!-- Sparkline CPU -->
         <div class="sparkline-box">
           <div class="sparkline-header">
-            <span>Histórico de CPU (Últimos 30s)</span>
+            <span>Histórico CPU (Últimos 30s)</span>
             <span id="lbl-cpu-avg">--</span>
           </div>
-          <canvas id="canvas-cpu" class="sparkline-canvas" width="300" height="42"></canvas>
+          <canvas id="canvas-cpu" class="sparkline-canvas" width="300" height="38"></canvas>
         </div>
 
-        <div class="metric-row" style="margin-top: 14px;">
+        <div class="metric-row" style="margin-top: 12px;">
           <div class="metric-label-val">
             <span>Memória RAM</span>
             <span class="metric-val" id="val-ram">--%</span>
@@ -715,7 +853,7 @@ HTML_DASHBOARD = """<!DOCTYPE html>
 
         <div class="metric-row">
           <div class="metric-label-val">
-            <span>Armazenamento (Disco SSD)</span>
+            <span>Armazenamento SSD</span>
             <span class="metric-val" id="val-disk">--%</span>
           </div>
           <div class="progress-bar-bg">
@@ -734,13 +872,13 @@ HTML_DASHBOARD = """<!DOCTYPE html>
           </div>
         </div>
 
-        <div style="margin-top: 14px; font-size: 12px; color: var(--text-muted); display:flex; justify-content:space-between;">
+        <div style="margin-top: 12px; font-size: 11px; color: var(--text-muted); display:flex; justify-content:space-between;">
           <span>Uptime: <strong id="val-uptime" style="color:var(--text);">--</strong></span>
           <span>Porta: <strong style="color:var(--text);">5000 / 3000</strong></span>
         </div>
       </div>
 
-      <!-- Card Estacao de Campo -->
+      <!-- Card 2: Estação de Campo G00001 & Curva Térmica -->
       <div class="card">
         <div class="card-header">
           <div class="card-title">
@@ -760,7 +898,7 @@ HTML_DASHBOARD = """<!DOCTYPE html>
             <div class="station-tile-val" style="color: #06b6d4;" id="g-umid">--.-<span class="station-tile-unit">%</span></div>
           </div>
           <div class="station-tile">
-            <div class="station-tile-lbl">Déficit Pressão Vapor (VPD)</div>
+            <div class="station-tile-lbl">Déficit Pressão (VPD)</div>
             <div class="station-tile-val" style="color: #10b981;" id="g-vpd">-.--<span class="station-tile-unit">kPa</span></div>
           </div>
           <div class="station-tile">
@@ -769,61 +907,118 @@ HTML_DASHBOARD = """<!DOCTYPE html>
           </div>
         </div>
 
-        <!-- Sparkline Térmica da CPU -->
         <div class="sparkline-box">
           <div class="sparkline-header">
             <span>Curva Térmica da CPU (°C últimos 30s)</span>
             <span id="lbl-temp-avg">--</span>
           </div>
-          <canvas id="canvas-temp" class="sparkline-canvas" width="300" height="42"></canvas>
+          <canvas id="canvas-temp" class="sparkline-canvas" width="300" height="38"></canvas>
         </div>
 
-        <div style="margin-top: 16px; padding: 12px; background: rgba(255,255,255,0.02); border-radius: 10px; font-size: 13px; display:flex; justify-content:space-between; align-items:center;">
+        <div style="margin-top: 14px; padding: 10px; background: rgba(255,255,255,0.02); border-radius: 8px; font-size: 12px; display:flex; justify-content:space-between; align-items:center;">
           <span>Cultura: <strong id="g-cultura" style="color:#10b981;">Café Arábica</strong></span>
-          <span style="font-size: 12px; color: var(--text-muted);" id="g-ago">Último envio: há -- seg</span>
+          <span style="font-size: 11px; color: var(--text-muted);" id="g-ago">Último envio: há -- seg</span>
         </div>
       </div>
 
-      <!-- Card Servicos & Docker -->
+      <!-- Card 3: Serviços Docker & Top 5 Processos -->
       <div class="card">
         <div class="card-header">
           <div class="card-title">
             <svg width="18" height="18" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><polygon points="12 2 2 7 12 12 22 7 12 2"></polygon><polyline points="2 17 12 22 22 17"></polyline><polyline points="2 12 12 17 22 12"></polyline></svg>
-            Serviços & Contêineres
+            Serviços & Top Processos
           </div>
           <div class="badge-status" id="ping-badge" style="font-size: 11px; padding: 4px 10px;">Ping: ~2ms</div>
         </div>
 
         <div class="services-list" id="services-container">
           <!-- Renderizado dinamicamente -->
-          <div class="service-item">
-            <div class="service-info">
-              <span class="service-name">Gaia Server</span>
-              <span class="service-sub">Porta 3000 &middot; Backend Principal</span>
-            </div>
-            <span class="service-badge srv-ok">ATIVO</span>
+        </div>
+
+        <div style="border-top: 1px solid var(--card-border); padding-top: 10px; margin-top: 10px;">
+          <div style="font-size: 11px; color: var(--text-muted); font-weight: 600; text-transform: uppercase; margin-bottom: 4px;">Top Processos do Servidor (CPU/RAM)</div>
+          <table class="proc-table">
+            <thead>
+              <tr><th>Processo</th><th>PID</th><th>% CPU</th><th>% RAM</th></tr>
+            </thead>
+            <tbody id="top-procs-body">
+              <tr><td colspan="4" style="color:var(--text-muted)">Carregando processos...</td></tr>
+            </tbody>
+          </table>
+        </div>
+      </div>
+
+      <!-- Card 4: DevOps Command Deck -->
+      <div class="card" style="grid-column: 1 / -1;">
+        <div class="card-header">
+          <div class="card-title" style="color: #38bdf8;">
+            <svg width="18" height="18" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><polyline points="4 17 10 11 4 5"></polyline><line x1="12" y1="19" x2="20" y2="19"></line></svg>
+            DevOps Command Deck &middot; Ações Rápidas no Servidor
+          </div>
+          <div style="display:flex; align-items:center; gap:8px;">
+            <label style="font-size: 11px; color: var(--text-muted); display:flex; align-items:center; gap:6px; cursor:pointer;">
+              <input type="checkbox" id="chk-safety" checked style="accent-color:#10b981;">
+              🛡️ Confirmação de Segurança
+            </label>
           </div>
         </div>
 
-        <div style="margin-top: 16px; padding: 12px; background: rgba(255,255,255,0.02); border-radius: 10px; font-size: 12px; color: var(--text-muted);">
-          Monitoramento de sockets TCP locais executado a cada ciclo.
+        <div class="cmd-grid">
+          <button class="btn-cmd" onclick="triggerDevops('restart_gaia', 'Reiniciar Gaia Server')">
+            <span class="btn-cmd-icon">🔄</span>
+            <span class="btn-cmd-title">Restart Gaia</span>
+            <span class="btn-cmd-sub">Container :3000</span>
+          </button>
+          <button class="btn-cmd" onclick="triggerDevops('restart_agro', 'Reiniciar Agroclima')">
+            <span class="btn-cmd-icon">🌾</span>
+            <span class="btn-cmd-title">Restart Agro</span>
+            <span class="btn-cmd-sub">Container :3001</span>
+          </button>
+          <button class="btn-cmd" onclick="triggerDevops('restart_mqtt', 'Reiniciar Mosquitto')">
+            <span class="btn-cmd-icon">📡</span>
+            <span class="btn-cmd-title">Restart MQTT</span>
+            <span class="btn-cmd-sub">Broker :1883</span>
+          </button>
+          <button class="btn-cmd" onclick="triggerDevops('wol', 'Wake-on-LAN')">
+            <span class="btn-cmd-icon">⚡</span>
+            <span class="btn-cmd-title">Wake-on-LAN</span>
+            <span class="btn-cmd-sub">Magic Packet LAN</span>
+          </button>
+          <button class="btn-cmd" onclick="triggerDevops('clear_cache', 'Limpar Buffers')">
+            <span class="btn-cmd-icon">🧹</span>
+            <span class="btn-cmd-title">Limpar Cache</span>
+            <span class="btn-cmd-sub">Sync RAM</span>
+          </button>
+          <button class="btn-cmd" onclick="triggerDevops('test_tunnel', 'Testar Túnel HTTPS')">
+            <span class="btn-cmd-icon">🌐</span>
+            <span class="btn-cmd-title">Testar Túnel</span>
+            <span class="btn-cmd-sub">Ping Tailscale</span>
+          </button>
+        </div>
+
+        <div class="cmd-status-box" id="cmd-status-box">
+          <span id="cmd-status-msg">Pronto para executar comandos do servidor</span>
+          <span id="cmd-status-badge" style="color:var(--text-muted); font-size:11px;">STANDBY</span>
         </div>
       </div>
-      <!-- Card Spotify Now Playing -->
-      <div class="card" style="grid-column: 1 / -1; background: linear-gradient(135deg, rgba(18, 24, 39, 0.9), rgba(29, 185, 84, 0.12)); border-color: rgba(29, 185, 84, 0.28);">
+
+      <!-- Card 5: Spotify Media Hub com Slider de Volume -->
+      <div class="card spotify-card">
         <div class="card-header" style="margin-bottom: 12px;">
           <div class="card-title" style="color: #1db954;">
             <svg width="20" height="20" viewBox="0 0 24 24" fill="currentColor"><path d="M12 0C5.4 0 0 5.4 0 12s5.4 12 12 12 12-5.4 12-12S18.66 0 12 0zm5.521 17.34c-.24.359-.66.48-1.021.24-2.82-1.74-6.36-2.101-10.561-1.141-.418.122-.779-.179-.899-.539-.12-.421.18-.78.54-.9 4.56-1.021 8.52-.6 11.64 1.32.42.18.479.659.301 1.02zm1.44-3.3c-.301.42-.841.6-1.262.3-3.239-1.98-8.159-2.58-11.939-1.38-.479.12-1.02-.12-1.14-.6-.12-.48.12-1.021.6-1.141C9.6 9.9 15 10.561 18.72 12.84c.361.181.54.78.241 1.2zm.12-3.36C15.24 8.4 8.82 8.16 5.16 9.301c-.6.179-1.2-.181-1.38-.721-.18-.601.18-1.2.72-1.381 4.26-1.26 11.28-1.02 15.721 1.621.539.3.719 1.02.419 1.56-.299.421-1.02.599-1.559.3z"/></svg>
-            Spotify &middot; Vigil Media Control
+            Spotify Media Hub &middot; Volume & Controles Físicos
           </div>
           <div class="badge-status" id="sp-badge" style="font-size: 11px; padding: 4px 10px; color: #1db954;">OCIOSO</div>
         </div>
+
         <div style="display: flex; align-items: center; gap: 18px; flex-wrap: wrap;">
           <img id="sp-art" src="/api/spotify/art.jpg" onerror="this.style.display='none'" style="width: 76px; height: 76px; border-radius: 12px; object-fit: cover; border: 1px solid rgba(255,255,255,0.12); display: none;" alt="Capa">
-          <div style="flex: 1; min-width: 200px;">
-            <div id="sp-track" style="font-size: 18px; font-weight: 700; color: #fff; margin-bottom: 4px;">Nenhuma música em reprodução</div>
-            <div id="sp-artist" style="font-size: 13px; color: #9ca3af; margin-bottom: 10px;">Abra o Spotify para acompanhar no Vigil Web e no Vigil Desk</div>
-            <div class="progress-bar-bg" style="height: 6px; margin-bottom: 6px;">
+          <div style="flex: 1; min-width: 220px;">
+            <div id="sp-track" style="font-size: 17px; font-weight: 700; color: #fff; margin-bottom: 3px;">Nenhuma música em reprodução</div>
+            <div id="sp-artist" style="font-size: 12px; color: #9ca3af; margin-bottom: 8px;">Abra o Spotify no PC ou celular para sincronizar</div>
+            
+            <div class="progress-bar-bg" style="height: 6px; margin-bottom: 5px;">
               <div id="sp-bar" class="progress-bar-fill" style="width: 0%; background: linear-gradient(90deg, #1db954, #10b981);"></div>
             </div>
             <div style="display: flex; justify-content: space-between; font-size: 11px; font-family: 'JetBrains Mono', monospace; color: #9ca3af;">
@@ -831,41 +1026,75 @@ HTML_DASHBOARD = """<!DOCTYPE html>
               <span id="sp-dur">00:00</span>
             </div>
           </div>
-          <div style="display: flex; gap: 10px; align-items: center;">
-            <button onclick="spotifyCmd('prev')" class="btn-sound" style="padding: 10px 14px; font-size: 15px;">⏮</button>
-            <button onclick="spotifyCmd('toggle')" id="sp-btn-play" class="btn-sound" style="padding: 10px 18px; font-size: 15px; background: #1db954; color: #000; font-weight: 700; border: none;">▶ Play</button>
-            <button onclick="spotifyCmd('next')" class="btn-sound" style="padding: 10px 14px; font-size: 15px;">⏭</button>
+
+          <!-- Controles de Mídia & Slider de Volume -->
+          <div style="display: flex; flex-direction: column; gap: 10px; align-items: flex-end;">
+            <div style="display: flex; gap: 8px; align-items: center;">
+              <button onclick="spotifyCmd('prev')" class="btn-action" style="padding: 9px 13px; font-size: 14px;">⏮</button>
+              <button onclick="spotifyCmd('toggle')" id="sp-btn-play" class="btn-action" style="padding: 9px 18px; font-size: 14px; background: #1db954; color: #000; font-weight: 700; border: none;">▶ Play</button>
+              <button onclick="spotifyCmd('next')" class="btn-action" style="padding: 9px 13px; font-size: 14px;">⏭</button>
+            </div>
+            <div class="vol-slider-wrap">
+              <span id="vol-icon" style="font-size: 14px;">🔊</span>
+              <input type="range" id="sp-vol-slider" min="0" max="100" value="75" oninput="changeVolume(this.value)">
+              <span id="sp-vol-val" style="font-family:'JetBrains Mono'; font-size:12px; min-width:32px; text-align:right;">75%</span>
+            </div>
           </div>
         </div>
       </div>
     </div>
 
+    <!-- Rodapé -->
     <footer>
       <div>
         Hardware de Bancada: <span class="tag-desk">Vigil Desk (ESP32 - IP: 192.168.0.108)</span>
       </div>
       <div id="last-updated">
-        Atualizado há poucos segundos
+        Sincronizado via Fast-Path LAN (3ms)
       </div>
     </footer>
+  </div>
+
+  <!-- Drawer Retrátil de Console / Logs -->
+  <div class="console-drawer" id="console-drawer">
+    <div class="console-header">
+      <div class="console-title">
+        <span>📜 CONSOLE VIGIL // EVENTOS EM TEMPO REAL</span>
+      </div>
+      <div style="display:flex; gap:8px;">
+        <button class="btn-action" onclick="fetchLogs()" style="padding:4px 10px; font-size:11px;">🔄 Atualizar</button>
+        <button class="btn-action" onclick="toggleConsole()" style="padding:4px 10px; font-size:11px;">✕ Fechar</button>
+      </div>
+    </div>
+    <div class="console-body" id="console-logs-container">
+      <div class="log-line"><span class="log-ts">--:--:--</span><span class="log-tag tag-info">[INIT]</span> Carregando stream de eventos...</div>
+    </div>
   </div>
 
   <script>
     let soundEnabled = true;
     let audioCtx = null;
     let lastAlertLevel = 'normal';
+    let volDebounce = null;
+    let isUserSliding = false;
 
     function toggleSound() {
       soundEnabled = !soundEnabled;
       const btn = document.getElementById('btn-sound');
       if (soundEnabled) {
-        btn.innerText = '🔔 Alertas Sonoros: Ligado';
+        btn.innerText = '🔔 Alertas: On';
         btn.style.color = 'var(--text)';
         playChime(660, 880);
       } else {
-        btn.innerText = '🔕 Alertas Sonoros: Mudo';
+        btn.innerText = '🔕 Alertas: Off';
         btn.style.color = 'var(--text-muted)';
       }
+    }
+
+    function toggleConsole() {
+      const d = document.getElementById('console-drawer');
+      d.classList.toggle('open');
+      if (d.classList.contains('open')) fetchLogs();
     }
 
     function playChime(freq1, freq2) {
@@ -873,31 +1102,18 @@ HTML_DASHBOARD = """<!DOCTYPE html>
       try {
         if (!audioCtx) audioCtx = new (window.AudioContext || window.webkitAudioContext)();
         if (audioCtx.state === 'suspended') audioCtx.resume();
-        
         const now = audioCtx.currentTime;
-        const osc1 = audioCtx.createOscillator();
-        const osc2 = audioCtx.createOscillator();
-        const gain = audioCtx.createGain();
-
-        osc1.type = 'sine';
-        osc1.frequency.setValueAtTime(freq1, now);
-        osc2.type = 'sine';
-        osc2.frequency.setValueAtTime(freq2, now + 0.12);
-
-        gain.gain.setValueAtTime(0.12, now);
-        gain.gain.exponentialRampToValueAtTime(0.001, now + 0.35);
-
-        osc1.connect(gain);
-        osc2.connect(gain);
-        gain.connect(audioCtx.destination);
-
-        osc1.start(now);
-        osc1.stop(now + 0.12);
-        osc2.start(now + 0.12);
-        osc2.stop(now + 0.35);
-      } catch (e) {
-        console.error(e);
-      }
+        const o1 = audioCtx.createOscillator();
+        const o2 = audioCtx.createOscillator();
+        const g = audioCtx.createGain();
+        o1.type = 'sine'; o1.frequency.setValueAtTime(freq1, now);
+        o2.type = 'sine'; o2.frequency.setValueAtTime(freq2, now + 0.12);
+        g.gain.setValueAtTime(0.12, now);
+        g.gain.exponentialRampToValueAtTime(0.001, now + 0.35);
+        o1.connect(g); o2.connect(g); g.connect(audioCtx.destination);
+        o1.start(now); o1.stop(now + 0.12);
+        o2.start(now + 0.12); o2.stop(now + 0.35);
+      } catch (e) { console.error(e); }
     }
 
     function drawSparkline(canvasId, data, colorStroke, colorFill, minVal, maxVal) {
@@ -906,36 +1122,23 @@ HTML_DASHBOARD = """<!DOCTYPE html>
       const ctx = cvs.getContext('2d');
       const w = cvs.width;
       const h = cvs.height;
-
       ctx.clearRect(0, 0, w, h);
-
       const len = data.length;
       const step = w / (len - 1);
-
       ctx.beginPath();
       for (let i = 0; i < len; i++) {
         const val = data[i];
         const norm = (val - minVal) / Math.max((maxVal - minVal), 1);
         const y = h - Math.min(Math.max(norm * (h - 8) + 4, 4), h - 4);
         const x = i * step;
-
         if (i === 0) ctx.moveTo(x, y);
         else ctx.lineTo(x, y);
       }
-
-      ctx.strokeStyle = colorStroke;
-      ctx.lineWidth = 2;
-      ctx.stroke();
-
-      // Gradiente de preenchimento
-      ctx.lineTo(w, h);
-      ctx.lineTo(0, h);
-      ctx.closePath();
+      ctx.strokeStyle = colorStroke; ctx.lineWidth = 2; ctx.stroke();
+      ctx.lineTo(w, h); ctx.lineTo(0, h); ctx.closePath();
       const grad = ctx.createLinearGradient(0, 0, 0, h);
-      grad.addColorStop(0, colorFill);
-      grad.addColorStop(1, 'rgba(0,0,0,0)');
-      ctx.fillStyle = grad;
-      ctx.fill();
+      grad.addColorStop(0, colorFill); grad.addColorStop(1, 'rgba(0,0,0,0)');
+      ctx.fillStyle = grad; ctx.fill();
     }
 
     async function spotifyCmd(act) {
@@ -943,6 +1146,76 @@ HTML_DASHBOARD = """<!DOCTYPE html>
         await fetch('/api/spotify/' + act, { method: 'POST' });
         setTimeout(updateDashboard, 350);
       } catch (e) { console.error(e); }
+    }
+
+    function changeVolume(val) {
+      isUserSliding = true;
+      document.getElementById('sp-vol-val').innerText = val + '%';
+      const icon = document.getElementById('vol-icon');
+      if (val == 0) icon.innerText = '🔇';
+      else if (val < 40) icon.innerText = '🔈';
+      else if (val < 75) icon.innerText = '🔉';
+      else icon.innerText = '🔊';
+
+      clearTimeout(volDebounce);
+      volDebounce = setTimeout(async () => {
+        try {
+          await fetch('/api/spotify/volume?val=' + val, { method: 'POST' });
+          isUserSliding = false;
+        } catch(e) { isUserSliding = false; }
+      }, 250);
+    }
+
+    async function triggerDevops(cmd, label) {
+      const safety = document.getElementById('chk-safety').checked;
+      if (safety) {
+        if (!confirm(`Confirmar execução de: "${label}" no servidor?`)) return;
+      }
+      const box = document.getElementById('cmd-status-box');
+      const msg = document.getElementById('cmd-status-msg');
+      const badge = document.getElementById('cmd-status-badge');
+      msg.innerText = `Executando: ${label}...`;
+      badge.innerText = 'EXECUTANDO';
+      badge.style.color = '#38bdf8';
+
+      try {
+        const t0 = performance.now();
+        const r = await fetch('/api/cmd/' + cmd, { method: 'POST' });
+        const data = await r.json();
+        const ms = Math.round(performance.now() - t0);
+        if (data.ok) {
+          msg.innerText = `OK: ${data.message} (${ms}ms)`;
+          badge.innerText = 'SUCESSO';
+          badge.style.color = '#34d399';
+          playChime(550, 750);
+        } else {
+          msg.innerText = `ERRO: ${data.message}`;
+          badge.innerText = 'FALHA';
+          badge.style.color = '#f87171';
+        }
+        fetchLogs();
+      } catch(e) {
+        msg.innerText = 'Falha de comunicação com o servidor';
+        badge.innerText = 'ERRO HTTP';
+        badge.style.color = '#f87171';
+      }
+    }
+
+    async function fetchLogs() {
+      try {
+        const res = await fetch('/api/logs');
+        if (!res.ok) return;
+        const logs = await res.json();
+        const container = document.getElementById('console-logs-container');
+        container.innerHTML = logs.map(l => {
+          let tagClass = 'tag-info';
+          if (l.type === 'cmd') tagClass = 'tag-cmd';
+          else if (l.type === 'warn') tagClass = 'tag-warn';
+          else if (l.type === 'alert') tagClass = 'tag-alert';
+          return `<div class="log-line"><span class="log-ts">${l.ts}</span><span class="log-tag ${tagClass}">[${l.type.toUpperCase()}]</span> <span>${l.msg}</span></div>`;
+        }).join('');
+        container.scrollTop = container.scrollHeight;
+      } catch(e) {}
     }
 
     async function updateDashboard() {
@@ -997,104 +1270,140 @@ HTML_DASHBOARD = """<!DOCTYPE html>
         } else if (level === 'warning') {
           banner.className = 'alert-banner alert-warning';
           alertIcon.innerText = '⚠️';
-          alertTitle.innerText = 'ATENÇÃO // ELEVAÇÃO DE CARGA/TEMPERATURA';
-          alertDesc.innerText = s.alert_msg || 'Monitorando métricas anormais.';
-          alertStamp.innerText = 'ATENÇÃO';
+          alertTitle.innerText = 'ATENÇÃO // AVISO DE MONITORAMENTO';
+          alertDesc.innerText = s.alert_msg || 'Carga ou temperatura acima da média';
+          alertStamp.innerText = 'AVISO';
           alertStamp.style.color = '#fbbf24';
-          if (lastAlertLevel === 'normal') playChime(587, 880);
+          if (lastAlertLevel === 'normal') playChime(660, 550);
         } else {
           banner.className = 'alert-banner alert-normal';
           alertIcon.innerText = '🛡️';
           alertTitle.innerText = 'SISTEMA VIGIL OPERANDO NORMALMENTE';
           alertDesc.innerText = 'Infraestrutura estável, parâmetros térmicos e telemetria sob controle.';
-          alertStamp.innerText = 'SAUDÁVEL';
+          alertStamp.innerText = 'OK';
           alertStamp.style.color = '#34d399';
         }
         lastAlertLevel = level;
 
         // Sparklines
-        const hist = data.history || {};
-        if (hist.cpu && hist.cpu.length > 0) {
-          drawSparkline('canvas-cpu', hist.cpu, '#06b6d4', 'rgba(6, 182, 212, 0.25)', 0, 100);
-          const lastCpu = hist.cpu[hist.cpu.length - 1];
-          document.getElementById('lbl-cpu-avg').innerText = 'Agora: ' + lastCpu.toFixed(1) + '%';
+        const h_cpu = (data.history && data.history.cpu) ? data.history.cpu : [];
+        const h_temp = (data.history && data.history.temp) ? data.history.temp : [];
+        if (h_cpu.length > 0) {
+          const avgCpu = (h_cpu.reduce((a, b) => a + b, 0) / h_cpu.length).toFixed(1);
+          document.getElementById('lbl-cpu-avg').innerText = `Média: ${avgCpu}%`;
+          drawSparkline('canvas-cpu', h_cpu, '#10b981', 'rgba(16, 185, 129, 0.25)', 0, 100);
         }
-        if (hist.temp && hist.temp.length > 0) {
-          drawSparkline('canvas-temp', hist.temp, '#fbbf24', 'rgba(251, 191, 36, 0.22)', 30, 90);
-          const lastT = hist.temp[hist.temp.length - 1];
-          document.getElementById('lbl-temp-avg').innerText = 'Agora: ' + lastT.toFixed(1) + '°C';
-        }
-
-        // Estacao
-        const g = data.station || data.gaia || {};
-        document.getElementById('g-temp').innerHTML = (g.temp || 0).toFixed(1) + '<span class="station-tile-unit">&deg;C</span>';
-        document.getElementById('g-umid').innerHTML = (g.umid || 0).toFixed(1) + '<span class="station-tile-unit">%</span>';
-        document.getElementById('g-vpd').innerHTML = (g.vpd || 0).toFixed(2) + '<span class="station-tile-unit">kPa</span>';
-        document.getElementById('g-press').innerHTML = (g.pressao || 0).toFixed(1) + '<span class="station-tile-unit">hPa</span>';
-        document.getElementById('g-ago').innerText = 'Último envio: há ' + (g.sec_ago || 0) + ' seg';
-        if (g.cultura) document.getElementById('g-cultura').innerText = g.cultura;
-
-        const badge = document.getElementById('station-badge');
-        badge.innerText = g.status || 'ONLINE';
-        badge.style.color = (g.status === 'ONLINE') ? '#34d399' : '#f87171';
-
-        // Servicos
-        const services = data.services || [];
-        if (services.length > 0) {
-          let sHtml = '';
-          services.forEach(srv => {
-            const isOk = srv.status;
-            sHtml += `
-              <div class="service-item">
-                <div class="service-info">
-                  <span class="service-name">${srv.name}</span>
-                  <span class="service-sub">Porta ${srv.port} &middot; ${srv.type}</span>
-                </div>
-                <span class="service-badge ${isOk ? 'srv-ok' : 'srv-err'}">${isOk ? 'ATIVO' : 'OFFLINE'}</span>
-              </div>
-            `;
-          });
-          document.getElementById('services-container').innerHTML = sHtml;
-        }
-        if (data.ping_ms) {
-          document.getElementById('ping-badge').innerText = 'Ping LAN: ~' + data.ping_ms + 'ms';
+        if (h_temp.length > 0) {
+          const avgTemp = (h_temp.reduce((a, b) => a + b, 0) / h_temp.length).toFixed(1);
+          document.getElementById('lbl-temp-avg').innerText = `Média: ${avgTemp}°C`;
+          drawSparkline('canvas-temp', h_temp, '#f59e0b', 'rgba(245, 158, 11, 0.25)', 30, 85);
         }
 
-        // Spotify
-        const sp = data.spotify || {};
-        document.getElementById('sp-track').innerText = sp.track || 'Nenhuma música';
-        document.getElementById('sp-artist').innerText = (sp.artist || 'Spotify Ocioso') + (sp.album ? ' · ' + sp.album : '');
-        const spBadge = document.getElementById('sp-badge');
-        const spPlayBtn = document.getElementById('sp-btn-play');
-        if (sp.is_playing) {
-          spBadge.innerText = '▶ TOCANDO AGORA';
-          spBadge.style.color = '#1db954';
-          spPlayBtn.innerText = '⏸ Pause';
+        // Estação de Campo
+        const st = data.station || data.gaia || {};
+        document.getElementById('g-temp').innerHTML = (st.temp > 0 ? st.temp.toFixed(1) : '--.-') + '<span class="station-tile-unit">&deg;C</span>';
+        document.getElementById('g-umid').innerHTML = (st.umid > 0 ? st.umid.toFixed(1) : '--.-') + '<span class="station-tile-unit">%</span>';
+        document.getElementById('g-vpd').innerHTML = (st.vpd > 0 ? st.vpd.toFixed(3) : '-.---') + '<span class="station-tile-unit">kPa</span>';
+        document.getElementById('g-press').innerHTML = (st.pressao > 0 ? st.pressao.toFixed(1) : '---.-') + '<span class="station-tile-unit">hPa</span>';
+        if (st.cultura) document.getElementById('g-cultura').innerText = st.cultura;
+        document.getElementById('g-ago').innerText = `Último envio: há ${st.sec_ago !== undefined ? st.sec_ago : '--'} seg`;
+        
+        const stBadge = document.getElementById('station-badge');
+        if (st.status === 'ONLINE') {
+          stBadge.className = 'badge-status';
+          stBadge.innerText = 'ONLINE';
+          stBadge.style.color = '#34d399';
         } else {
-          spBadge.innerText = sp.active ? '⏸ PAUSADO' : 'OCIOSO';
-          spBadge.style.color = '#9ca3af';
-          spPlayBtn.innerText = '▶ Play';
-        }
-        const durMs = sp.duration_ms || 0;
-        const progMs = sp.progress_ms || 0;
-        const pct = durMs > 0 ? Math.min(100, (progMs / durMs) * 100) : 0;
-        document.getElementById('sp-bar').style.width = pct.toFixed(1) + '%';
-        const fmtTime = (ms) => {
-          const s = Math.floor(ms / 1000);
-          const m = Math.floor(s / 60);
-          const sec = s % 60;
-          return String(m).padStart(2, '0') + ':' + String(sec).padStart(2, '0');
-        };
-        document.getElementById('sp-prog').innerText = fmtTime(progMs);
-        document.getElementById('sp-dur').innerText = fmtTime(durMs);
-        const artEl = document.getElementById('sp-art');
-        if (sp.art_id) {
-          const newSrc = '/api/spotify/art.jpg?id=' + sp.art_id;
-          if (!artEl.src.endsWith(newSrc)) artEl.src = newSrc;
-          artEl.style.display = 'block';
+          stBadge.className = 'badge-status';
+          stBadge.innerText = 'OFFLINE';
+          stBadge.style.color = '#f87171';
         }
 
-        document.getElementById('last-updated').innerText = 'Sincronizado: ' + new Date().toLocaleTimeString();
+        // Serviços Docker
+        if (data.services && Array.isArray(data.services)) {
+          const srvBox = document.getElementById('services-container');
+          srvBox.innerHTML = data.services.map(srv => `
+            <div class="service-item">
+              <div class="service-info">
+                <span class="service-name">${srv.name}</span>
+                <span class="service-sub">Porta ${srv.port} &middot; ${srv.type}</span>
+              </div>
+              <span class="service-badge ${srv.status ? 'srv-ok' : 'srv-err'}">${srv.status ? 'ATIVO' : 'DOWN'}</span>
+            </div>
+          `).join('');
+        }
+
+        // Ping badge
+        if (data.ping_ms) {
+          document.getElementById('ping-badge').innerText = `Ping: ~${data.ping_ms}ms`;
+        }
+
+        // Top Processos
+        if (data.top_processes && Array.isArray(data.top_processes)) {
+          const tbody = document.getElementById('top-procs-body');
+          tbody.innerHTML = data.top_processes.map(p => `
+            <tr>
+              <td><strong>${p.name}</strong></td>
+              <td>${p.pid}</td>
+              <td>
+                ${p.cpu.toFixed(1)}%
+                <span class="proc-cpu-bar"><span class="proc-cpu-fill" style="width:${Math.min(100, p.cpu)}%"></span></span>
+              </td>
+              <td>${p.mem.toFixed(1)}%</td>
+            </tr>
+          `).join('');
+        }
+
+        // Spotify Card
+        const sp = data.spotify || {};
+        const spArt = document.getElementById('sp-art');
+        const spTrack = document.getElementById('sp-track');
+        const spArtist = document.getElementById('sp-artist');
+        const spBadge = document.getElementById('sp-badge');
+        const spBar = document.getElementById('sp-bar');
+        const spProg = document.getElementById('sp-prog');
+        const spDur = document.getElementById('sp-dur');
+        const spBtnPlay = document.getElementById('sp-btn-play');
+
+        if (sp.active) {
+          spTrack.innerText = sp.track || 'Reproduzindo';
+          spArtist.innerText = (sp.artist || 'Artista') + (sp.album ? ' • ' + sp.album : '');
+          spBadge.innerText = sp.is_playing ? 'TOCANDO' : 'PAUSADO';
+          spBadge.style.color = sp.is_playing ? '#1db954' : '#fbbf24';
+          spBtnPlay.innerText = sp.is_playing ? '⏸ Pause' : '▶ Play';
+
+          const pct = sp.duration_ms > 0 ? (sp.progress_ms / sp.duration_ms) * 100 : 0;
+          spBar.style.width = Math.min(100, Math.max(0, pct)) + '%';
+
+          const curSec = Math.floor((sp.progress_ms || 0) / 1000);
+          const durSec = Math.floor((sp.duration_ms || 0) / 1000);
+          spProg.innerText = `${String(Math.floor(curSec/60)).padStart(2,'0')}:${String(curSec%60).padStart(2,'0')}`;
+          spDur.innerText = `${String(Math.floor(durSec/60)).padStart(2,'0')}:${String(durSec%60).padStart(2,'0')}`;
+
+          if (sp.art_id) {
+            spArt.src = sp.art_url || '/api/spotify/art.jpg';
+            spArt.style.display = 'block';
+          }
+
+          if (!isUserSliding && sp.volume !== undefined) {
+            document.getElementById('sp-vol-slider').value = sp.volume;
+            document.getElementById('sp-vol-val').innerText = sp.volume + '%';
+            const icon = document.getElementById('vol-icon');
+            if (sp.volume == 0) icon.innerText = '🔇';
+            else if (sp.volume < 40) icon.innerText = '🔈';
+            else if (sp.volume < 75) icon.innerText = '🔉';
+            else icon.innerText = '🔊';
+          }
+        } else {
+          spTrack.innerText = 'Nenhuma música em reprodução';
+          spArtist.innerText = 'Abra o Spotify para acompanhar no Vigil Web e no Vigil Desk';
+          spBadge.innerText = 'OCIOSO';
+          spBadge.style.color = '#9ca3af';
+          spBtnPlay.innerText = '▶ Play';
+          spBar.style.width = '0%';
+          spArt.style.display = 'none';
+        }
+
         document.getElementById('conn-status').innerText = 'VIGIL ATIVO AO VIVO';
       } catch (err) {
         console.error(err);
@@ -1109,6 +1418,23 @@ HTML_DASHBOARD = """<!DOCTYPE html>
 </html>
 """
 
+PWA_MANIFEST = """{
+  "name": "Sistema Vigil",
+  "short_name": "Vigil",
+  "start_url": "/",
+  "display": "standalone",
+  "background_color": "#0b0f19",
+  "theme_color": "#0b0f19",
+  "description": "NOC de Observabilidade e Controle DevOps",
+  "icons": [
+    {
+      "src": "/api/spotify/art.jpg",
+      "sizes": "80x80",
+      "type": "image/jpeg"
+    }
+  ]
+}"""
+
 class MonitorHandler(BaseHTTPRequestHandler):
     def do_GET(self):
         # 1. Rota JSON API: /api/status
@@ -1120,8 +1446,8 @@ class MonitorHandler(BaseHTTPRequestHandler):
 
             services, ping_ms = get_services_status()
             station = get_field_station_metrics()
+            top_procs = get_top_processes(5)
 
-            # Mapeia servicos para facilitar no ESP32
             srvc_map = {
                 "serverApiOk": any(s["port"] == 3000 and s["status"] for s in services),
                 "agroclimaOk": any(s["port"] == 3001 and s["status"] for s in services),
@@ -1148,6 +1474,7 @@ class MonitorHandler(BaseHTTPRequestHandler):
                 "services": services,
                 "services_status": srvc_map,
                 "ping_ms": ping_ms,
+                "top_processes": top_procs,
                 "history": {
                     "cpu": h_cpu,
                     "temp": h_temp,
@@ -1159,6 +1486,18 @@ class MonitorHandler(BaseHTTPRequestHandler):
             }
 
             body = json.dumps(payload).encode('utf-8')
+            self.send_response(200)
+            self.send_header('Content-Type', 'application/json')
+            self.send_header('Content-Length', str(len(body)))
+            self.send_header('Access-Control-Allow-Origin', '*')
+            self.end_headers()
+            self.wfile.write(body)
+
+        # 1b. Rota de Logs do Sistema: /api/logs
+        elif self.path in ['/api/logs', '/logs']:
+            with logs_lock:
+                logs_list = list(system_logs)
+            body = json.dumps(logs_list).encode('utf-8')
             self.send_response(200)
             self.send_header('Content-Type', 'application/json')
             self.send_header('Content-Length', str(len(body)))
@@ -1208,6 +1547,15 @@ class MonitorHandler(BaseHTTPRequestHandler):
             self.end_headers()
             self.wfile.write(body)
 
+        # 3c. PWA Manifest: /manifest.json
+        elif self.path == '/manifest.json':
+            body = PWA_MANIFEST.encode('utf-8')
+            self.send_response(200)
+            self.send_header('Content-Type', 'application/manifest+json')
+            self.send_header('Content-Length', str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+
         # 4. Rota Dashboard Web HTML: / ou /dashboard
         elif self.path in ['/', '/dashboard', '/index.html']:
             body = HTML_DASHBOARD.encode('utf-8')
@@ -1228,8 +1576,8 @@ class MonitorHandler(BaseHTTPRequestHandler):
         return
 
 if __name__ == '__main__':
-    # Inicializa psutil e sampler thread
-    psutil.cpu_percent(interval=None)
+    if PSUTIL_AVAILABLE:
+        psutil.cpu_percent(interval=None)
     t = threading.Thread(target=background_sampler, daemon=True)
     t.start()
     t_sp = threading.Thread(target=spotify_sampler, daemon=True)

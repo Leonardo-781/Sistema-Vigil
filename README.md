@@ -34,15 +34,20 @@ Gire o **Rotary Encoder** para navegar entre as 6 telas ou clique no botão do E
 
 ---
 
-## 📸 Painel Web (Vigil Web)
+## 📸 Painel Web (Vigil Web v2.5)
 
-Painel responsivo (*Dark Mode Glassmorphism*) com sincronização automática a cada 1.5s via AJAX:
+Painel responsivo (*Dark Mode Glassmorphism*) com sincronização automática a cada 1.5s via AJAX e suporte a PWA (Progressive Web App):
 
-- 🌡️ **Temperatura Térmica da CPU** com indicador dinâmico de cores (Verde < 60°C, Amarelo 60-75°C, Vermelho > 75°C);
-- 📊 **Barras de Gradiente:** % de CPU, Memória RAM e Espaço em Disco SSD;
+- 🌡️ **Temperatura Térmica da CPU** com indicador dinâmico de cores (Verde < 60°C, Amarelo 60-75°C, Vermelho > 75°C) e sparkline histórica;
+- 📊 **Barras de Gradiente & Histórico:** % de CPU, Memória RAM e Espaço em Disco SSD com curvas ao vivo;
+- ⚡ **DevOps Command Deck na Web:** Botões táteis com confirmação de segurança para executar ações no servidor (`Restart Gaia`, `Restart Agroclima`, `Restart Mosquitto`, `Wake-on-LAN`, `Limpar Buffers`, `Testar Túnel HTTPS`) com feedback de latência;
+- 🎛️ **Controle de Volume do Spotify Deslizante:** Slider contínuo (`0% a 100%`) com ícones dinâmicos (`🔇`, `🔉`, `🔊`) sincronizado com o display físico do Vigil Desk;
+- 📈 **Top 5 Processos em Tempo Real (Mini `htop`):** Tabela compacta com PID, nome do processo, micro-barra de CPU e consumo de memória RAM;
+- 🌐 **Barra de Atalhos do Ecossistema:** Acesso direto a Gaia (`:3000`), Agroclima (`:3001`), Portainer (`:9000`), Adminer (`:8080`) e Túnel Tailscale;
+- 📜 **Console / Drawer de Logs ao Vivo:** Gaveta retrátil na base da tela exibindo stream de eventos em tempo real (`[INFO]`, `[CMD]`, `[WARN]`, `[ALERT]`) com timestamps;
 - ⚡ **Velocímetros de Rede:** Taxa real de Download (RX) e Upload (TX) em KB/s;
-- 🎵 **Status Spotify Integrado:** Metadados da música atual, progresso, volume e proxy de capa 80x80 JPEG (`/api/spotify/cover.jpg`);
-- 🌐 **Acesso Local ou Remoto:** Acessível na LAN (`http://IP_LOCAL:5000`) com Fast-Path de baixa latência (~3ms) ou via **Tailscale Funnel / Cloudflare Tunnel** seguro (HTTPS).
+- 📡 **Telemetria de Campo:** Temperatura, umidade, VPD e pressão atmosférica da estação GAIA remota;
+- 📱 **Modo PWA:** Suporte a "Adicionar à tela de início" no Android/iOS para rodar como aplicativo em tela cheia.
 
 ---
 
