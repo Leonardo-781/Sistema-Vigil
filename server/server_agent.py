@@ -1,3 +1,4 @@
+import subprocess
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
@@ -16,7 +17,217 @@ import collections
 import threading
 import urllib.request
 import psutil
-from http.server import HTTPServer, BaseHTTPRequestHandler
+from http.server import HTTPServer, ThreadingHTTPServer, BaseHTTPRequestHandler
+import base64
+import urllib.parse
+import io
+try:
+    from PIL import Image
+    PIL_AVAILABLE = True
+except Exception:
+    PIL_AVAILABLE = False
+
+spotify_lock = threading.Lock()
+spotify_state = {
+    "active": False,
+    "is_playing": False,
+    "track": "Nenhuma música",
+    "artist": "Spotify Ocioso",
+    "album": "",
+    "progress_ms": 0,
+    "duration_ms": 0,
+    "volume": 75,
+    "art_id": "",
+    "art_url": "/api/spotify/art.jpg"
+}
+spotify_art_bytes = b""
+spotify_last_art_src = ""
+spotify_access_token = ""
+spotify_token_exp = 0.0
+
+def load_spotify_config():
+    for p in ["/home/leo/spotify_config.json", os.path.join(os.path.dirname(__file__), "..", "spotify_config.json"), "spotify_config.json"]:
+        if os.path.exists(p):
+            try:
+                with open(p, "r", encoding="utf-8") as f:
+                    return json.load(f)
+            except Exception:
+                pass
+    return None
+
+def get_spotify_token():
+    global spotify_access_token, spotify_token_exp
+    now = time.time()
+    if spotify_access_token and now < spotify_token_exp - 60:
+        return spotify_access_token
+    cfg = load_spotify_config()
+    if not cfg or not cfg.get("refresh_token"):
+        return None
+    try:
+        auth_str = f"{cfg['client_id']}:{cfg['client_secret']}"
+        b64_auth = base64.b64encode(auth_str.encode("utf-8")).decode("utf-8")
+        data = urllib.parse.urlencode({
+            "grant_type": "refresh_token",
+            "refresh_token": cfg["refresh_token"]
+        }).encode("utf-8")
+        req = urllib.request.Request(
+            "https://accounts.spotify.com/api/token",
+            data=data,
+            headers={
+                "Authorization": f"Basic {b64_auth}",
+                "Content-Type": "application/x-www-form-urlencoded"
+            }
+        )
+        with urllib.request.urlopen(req, timeout=5) as resp:
+            res = json.loads(resp.read().decode("utf-8"))
+            spotify_access_token = res.get("access_token", "")
+            spotify_token_exp = now + int(res.get("expires_in", 3600))
+            return spotify_access_token
+    except Exception:
+        return None
+
+def update_spotify_art(img_url, track_id):
+    global spotify_art_bytes, spotify_last_art_src
+    if not img_url or img_url == spotify_last_art_src:
+        return
+    try:
+        req = urllib.request.Request(img_url, headers={"User-Agent": "VigilAgent/2.0"})
+        with urllib.request.urlopen(req, timeout=5) as resp:
+            raw = resp.read()
+        if PIL_AVAILABLE:
+            im = Image.open(io.BytesIO(raw)).convert("RGB")
+            im = im.resize((80, 80), Image.Resampling.LANCZOS)
+            out = io.BytesIO()
+            # Baseline JPEG (progressive=False) obrigatorio para TJpg_Decoder no ESP32
+            im.save(out, format="JPEG", quality=82, optimize=False, progressive=False)
+            spotify_art_bytes = out.getvalue()
+        else:
+            spotify_art_bytes = raw
+        spotify_last_art_src = img_url
+    except Exception:
+        pass
+
+def spotify_command(action):
+    token = get_spotify_token()
+    if not token:
+        return False
+    try:
+        with spotify_lock:
+            currently_playing = spotify_state.get("is_playing", False)
+        if action == "toggle":
+            action = "pause" if currently_playing else "play"
+        if action == "play":
+            url = "https://api.spotify.com/v1/me/player/play"
+            method = "PUT"
+        elif action == "pause":
+            url = "https://api.spotify.com/v1/me/player/pause"
+            method = "PUT"
+        elif action == "next":
+            url = "https://api.spotify.com/v1/me/player/next"
+            method = "POST"
+        elif action == "prev":
+            url = "https://api.spotify.com/v1/me/player/previous"
+            method = "POST"
+        elif action.startswith("volume"):
+            vol = 75
+            if ":" in action:
+                vol = max(0, min(100, int(action.split(":")[1])))
+            url = f"https://api.spotify.com/v1/me/player/volume?volume_percent={vol}"
+            method = "PUT"
+            with spotify_lock:
+                spotify_state["volume"] = vol
+        else:
+            return False
+        req = urllib.request.Request(url, data=b"", method=method, headers={
+            "Authorization": f"Bearer {token}",
+            "Content-Length": "0"
+        })
+        with urllib.request.urlopen(req, timeout=4) as resp:
+            return resp.status in [200, 202, 204]
+    except Exception:
+        return False
+
+def execute_devops_command(cmd_name):
+    """Executa comandos rapidos do Vigil Command Deck com seguranca"""
+    try:
+        if cmd_name == "restart_gaia":
+            subprocess.Popen(["sh", "-c", "docker restart $(docker ps -q --filter ancestor=gaia) 2>/dev/null || docker restart gaia 2>/dev/null || true"])
+            return True, "Container Gaia reiniciado"
+        elif cmd_name == "restart_agro":
+            subprocess.Popen(["sh", "-c", "docker restart $(docker ps -q --filter name=agro) 2>/dev/null || true"])
+            return True, "Container Agroclima reiniciado"
+        elif cmd_name == "restart_mqtt":
+            subprocess.Popen(["sh", "-c", "docker restart $(docker ps -q --filter name=mosquitto) 2>/dev/null || systemctl restart mosquitto 2>/dev/null || true"])
+            return True, "Broker MQTT reiniciado"
+        elif cmd_name == "wol":
+            # Envia Magic Packet UDP broadcast na LAN
+            mac_bytes = bytes.fromhex("FFFFFFFFFFFF")
+            pkt = b"\xff" * 6 + mac_bytes * 16
+            with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as s:
+                s.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
+                s.sendto(pkt, ("255.255.255.255", 9))
+            return True, "Magic Packet WOL enviado"
+        elif cmd_name == "clear_cache":
+            subprocess.Popen(["sh", "-c", "sync"])
+            return True, "Buffers sincronizados"
+        elif cmd_name == "test_tunnel":
+            t0 = time.time()
+            req = urllib.request.Request("https://server1.taila7d06b.ts.net:10000/api/status", headers={"User-Agent": "VigilDeck/2.0"})
+            with urllib.request.urlopen(req, timeout=4) as r:
+                ms = int((time.time() - t0) * 1000)
+                return (r.status == 200), f"Tunel OK ({ms}ms)"
+    except Exception as e:
+        return False, str(e)[:32]
+    return False, "Comando desconhecido"
+
+def spotify_sampler():
+    global spotify_state
+    while True:
+        try:
+            token = get_spotify_token()
+            if token:
+                req = urllib.request.Request(
+                    "https://api.spotify.com/v1/me/player",
+                    headers={"Authorization": f"Bearer {token}"}
+                )
+                with urllib.request.urlopen(req, timeout=4) as resp:
+                    if resp.status == 200:
+                        data = json.loads(resp.read().decode("utf-8"))
+                        item = data.get("item") or {}
+                        if item:
+                            track_name = item.get("name") or "Faixa Desconhecida"
+                            artists = ", ".join([a.get("name", "") for a in item.get("artists", []) if a.get("name")])
+                            album_obj = item.get("album") or {}
+                            album_name = album_obj.get("name") or ""
+                            images = album_obj.get("images") or []
+                            img_url = images[-1]["url"] if images else ""
+                            if len(images) >= 2:
+                                img_url = images[1]["url"]
+                            track_id = (item.get("id") or track_name)[:12]
+                            update_spotify_art(img_url, track_id)
+                            with spotify_lock:
+                                spotify_state = {
+                                    "active": True,
+                                    "is_playing": bool(data.get("is_playing", False)),
+                                    "track": track_name,
+                                    "artist": artists or "Artista",
+                                    "album": album_name,
+                                    "progress_ms": int(data.get("progress_ms") or 0),
+                                    "duration_ms": int(item.get("duration_ms") or 0),
+                                    "volume": int((data.get("device") or {}).get("volume_percent") or spotify_state.get("volume", 75)),
+                                    "art_id": track_id,
+                                    "art_url": f"/api/spotify/art.jpg?id={track_id}"
+                                }
+                    elif resp.status == 204:
+                        with spotify_lock:
+                            spotify_state["is_playing"] = False
+                            if not spotify_state.get("active"):
+                                spotify_state["track"] = "Nenhuma música"
+                                spotify_state["artist"] = "Spotify Ocioso"
+        except Exception:
+            pass
+        time.sleep(2.0)
+
 
 # Ring buffer de histórico para gráficos em tempo real (últimos 30 pontos)
 history_lock = threading.Lock()
@@ -468,7 +679,7 @@ HTML_DASHBOARD = """<!DOCTYPE html>
         <div class="card-header">
           <div class="card-title">
             <svg width="18" height="18" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><rect x="2" y="2" width="20" height="8" rx="2"/><rect x="2" y="14" width="20" height="8" rx="2"/><line x1="6" y1="6" x2="6.01" y2="6"/><line x1="6" y1="18" x2="6.01" y2="18"/></svg>
-            Servidor Ubuntu (IP_DO_SERVIDOR)
+            Servidor Ubuntu (192.168.0.105)
           </div>
           <div id="temp-badge" class="temp-badge temp-good">--.- &deg;C</div>
         </div>
@@ -598,11 +809,40 @@ HTML_DASHBOARD = """<!DOCTYPE html>
           Monitoramento de sockets TCP locais executado a cada ciclo.
         </div>
       </div>
+      <!-- Card Spotify Now Playing -->
+      <div class="card" style="grid-column: 1 / -1; background: linear-gradient(135deg, rgba(18, 24, 39, 0.9), rgba(29, 185, 84, 0.12)); border-color: rgba(29, 185, 84, 0.28);">
+        <div class="card-header" style="margin-bottom: 12px;">
+          <div class="card-title" style="color: #1db954;">
+            <svg width="20" height="20" viewBox="0 0 24 24" fill="currentColor"><path d="M12 0C5.4 0 0 5.4 0 12s5.4 12 12 12 12-5.4 12-12S18.66 0 12 0zm5.521 17.34c-.24.359-.66.48-1.021.24-2.82-1.74-6.36-2.101-10.561-1.141-.418.122-.779-.179-.899-.539-.12-.421.18-.78.54-.9 4.56-1.021 8.52-.6 11.64 1.32.42.18.479.659.301 1.02zm1.44-3.3c-.301.42-.841.6-1.262.3-3.239-1.98-8.159-2.58-11.939-1.38-.479.12-1.02-.12-1.14-.6-.12-.48.12-1.021.6-1.141C9.6 9.9 15 10.561 18.72 12.84c.361.181.54.78.241 1.2zm.12-3.36C15.24 8.4 8.82 8.16 5.16 9.301c-.6.179-1.2-.181-1.38-.721-.18-.601.18-1.2.72-1.381 4.26-1.26 11.28-1.02 15.721 1.621.539.3.719 1.02.419 1.56-.299.421-1.02.599-1.559.3z"/></svg>
+            Spotify &middot; Vigil Media Control
+          </div>
+          <div class="badge-status" id="sp-badge" style="font-size: 11px; padding: 4px 10px; color: #1db954;">OCIOSO</div>
+        </div>
+        <div style="display: flex; align-items: center; gap: 18px; flex-wrap: wrap;">
+          <img id="sp-art" src="/api/spotify/art.jpg" onerror="this.style.display='none'" style="width: 76px; height: 76px; border-radius: 12px; object-fit: cover; border: 1px solid rgba(255,255,255,0.12); display: none;" alt="Capa">
+          <div style="flex: 1; min-width: 200px;">
+            <div id="sp-track" style="font-size: 18px; font-weight: 700; color: #fff; margin-bottom: 4px;">Nenhuma música em reprodução</div>
+            <div id="sp-artist" style="font-size: 13px; color: #9ca3af; margin-bottom: 10px;">Abra o Spotify para acompanhar no Vigil Web e no Vigil Desk</div>
+            <div class="progress-bar-bg" style="height: 6px; margin-bottom: 6px;">
+              <div id="sp-bar" class="progress-bar-fill" style="width: 0%; background: linear-gradient(90deg, #1db954, #10b981);"></div>
+            </div>
+            <div style="display: flex; justify-content: space-between; font-size: 11px; font-family: 'JetBrains Mono', monospace; color: #9ca3af;">
+              <span id="sp-prog">00:00</span>
+              <span id="sp-dur">00:00</span>
+            </div>
+          </div>
+          <div style="display: flex; gap: 10px; align-items: center;">
+            <button onclick="spotifyCmd('prev')" class="btn-sound" style="padding: 10px 14px; font-size: 15px;">⏮</button>
+            <button onclick="spotifyCmd('toggle')" id="sp-btn-play" class="btn-sound" style="padding: 10px 18px; font-size: 15px; background: #1db954; color: #000; font-weight: 700; border: none;">▶ Play</button>
+            <button onclick="spotifyCmd('next')" class="btn-sound" style="padding: 10px 14px; font-size: 15px;">⏭</button>
+          </div>
+        </div>
+      </div>
     </div>
 
     <footer>
       <div>
-        Hardware de Bancada: <span class="tag-desk">Vigil Desk (ESP32 - IP: IP_DO_VIGIL_DESK)</span>
+        Hardware de Bancada: <span class="tag-desk">Vigil Desk (ESP32 - IP: 192.168.0.108)</span>
       </div>
       <div id="last-updated">
         Atualizado há poucos segundos
@@ -696,6 +936,13 @@ HTML_DASHBOARD = """<!DOCTYPE html>
       grad.addColorStop(1, 'rgba(0,0,0,0)');
       ctx.fillStyle = grad;
       ctx.fill();
+    }
+
+    async function spotifyCmd(act) {
+      try {
+        await fetch('/api/spotify/' + act, { method: 'POST' });
+        setTimeout(updateDashboard, 350);
+      } catch (e) { console.error(e); }
     }
 
     async function updateDashboard() {
@@ -813,6 +1060,40 @@ HTML_DASHBOARD = """<!DOCTYPE html>
           document.getElementById('ping-badge').innerText = 'Ping LAN: ~' + data.ping_ms + 'ms';
         }
 
+        // Spotify
+        const sp = data.spotify || {};
+        document.getElementById('sp-track').innerText = sp.track || 'Nenhuma música';
+        document.getElementById('sp-artist').innerText = (sp.artist || 'Spotify Ocioso') + (sp.album ? ' · ' + sp.album : '');
+        const spBadge = document.getElementById('sp-badge');
+        const spPlayBtn = document.getElementById('sp-btn-play');
+        if (sp.is_playing) {
+          spBadge.innerText = '▶ TOCANDO AGORA';
+          spBadge.style.color = '#1db954';
+          spPlayBtn.innerText = '⏸ Pause';
+        } else {
+          spBadge.innerText = sp.active ? '⏸ PAUSADO' : 'OCIOSO';
+          spBadge.style.color = '#9ca3af';
+          spPlayBtn.innerText = '▶ Play';
+        }
+        const durMs = sp.duration_ms || 0;
+        const progMs = sp.progress_ms || 0;
+        const pct = durMs > 0 ? Math.min(100, (progMs / durMs) * 100) : 0;
+        document.getElementById('sp-bar').style.width = pct.toFixed(1) + '%';
+        const fmtTime = (ms) => {
+          const s = Math.floor(ms / 1000);
+          const m = Math.floor(s / 60);
+          const sec = s % 60;
+          return String(m).padStart(2, '0') + ':' + String(sec).padStart(2, '0');
+        };
+        document.getElementById('sp-prog').innerText = fmtTime(progMs);
+        document.getElementById('sp-dur').innerText = fmtTime(durMs);
+        const artEl = document.getElementById('sp-art');
+        if (sp.art_id) {
+          const newSrc = '/api/spotify/art.jpg?id=' + sp.art_id;
+          if (!artEl.src.endsWith(newSrc)) artEl.src = newSrc;
+          artEl.style.display = 'block';
+        }
+
         document.getElementById('last-updated').innerText = 'Sincronizado: ' + new Date().toLocaleTimeString();
         document.getElementById('conn-status').innerText = 'VIGIL ATIVO AO VIVO';
       } catch (err) {
@@ -873,7 +1154,8 @@ class MonitorHandler(BaseHTTPRequestHandler):
                     "ram": h_ram
                 },
                 "station": station,
-                "gaia": station
+                "gaia": station,
+                "spotify": dict(spotify_state)
             }
 
             body = json.dumps(payload).encode('utf-8')
@@ -884,7 +1166,49 @@ class MonitorHandler(BaseHTTPRequestHandler):
             self.end_headers()
             self.wfile.write(body)
 
-        # 2. Rota Dashboard Web HTML: / ou /dashboard
+        # 2. Rota Imagem Capa Spotify (80x80 Baseline JPEG)
+        elif self.path.startswith('/api/spotify/art.jpg'):
+            if spotify_art_bytes:
+                self.send_response(200)
+                self.send_header('Content-Type', 'image/jpeg')
+                self.send_header('Content-Length', str(len(spotify_art_bytes)))
+                self.send_header('Cache-Control', 'public, max-age=300')
+                self.end_headers()
+                self.wfile.write(spotify_art_bytes)
+            else:
+                self.send_response(404)
+                self.end_headers()
+
+        # 3. Rotas de Controle Spotify (GET ou POST, incluindo volume?val=XX)
+        elif self.path.startswith('/api/spotify/'):
+            parsed = urllib.parse.urlparse(self.path)
+            act = parsed.path.split('/api/spotify/')[-1].strip('/')
+            if act == "volume":
+                qs = urllib.parse.parse_qs(parsed.query)
+                val = qs.get("val", ["75"])[0]
+                act = f"volume:{val}"
+            ok = spotify_command(act)
+            body = json.dumps({"ok": ok, "action": act}).encode('utf-8')
+            self.send_response(200 if ok else 400)
+            self.send_header('Content-Type', 'application/json')
+            self.send_header('Content-Length', str(len(body)))
+            self.send_header('Access-Control-Allow-Origin', '*')
+            self.end_headers()
+            self.wfile.write(body)
+
+        # 3b. Rotas do Vigil Command Deck (/api/cmd/<comando>)
+        elif self.path.startswith('/api/cmd/'):
+            cmd_name = self.path.split('/api/cmd/')[-1].split('?')[0].strip('/')
+            ok, msg = execute_devops_command(cmd_name)
+            body = json.dumps({"ok": ok, "command": cmd_name, "message": msg}).encode('utf-8')
+            self.send_response(200 if ok else 400)
+            self.send_header('Content-Type', 'application/json')
+            self.send_header('Content-Length', str(len(body)))
+            self.send_header('Access-Control-Allow-Origin', '*')
+            self.end_headers()
+            self.wfile.write(body)
+
+        # 4. Rota Dashboard Web HTML: / ou /dashboard
         elif self.path in ['/', '/dashboard', '/index.html']:
             body = HTML_DASHBOARD.encode('utf-8')
             self.send_response(200)
@@ -897,6 +1221,9 @@ class MonitorHandler(BaseHTTPRequestHandler):
             self.send_response(404)
             self.end_headers()
 
+    def do_POST(self):
+        return self.do_GET()
+
     def log_message(self, format, *args):
         return
 
@@ -905,7 +1232,9 @@ if __name__ == '__main__':
     psutil.cpu_percent(interval=None)
     t = threading.Thread(target=background_sampler, daemon=True)
     t.start()
+    t_sp = threading.Thread(target=spotify_sampler, daemon=True)
+    t_sp.start()
 
     server_address = ('0.0.0.0', 5000)
-    httpd = HTTPServer(server_address, MonitorHandler)
+    httpd = ThreadingHTTPServer(server_address, MonitorHandler)
     httpd.serve_forever()
