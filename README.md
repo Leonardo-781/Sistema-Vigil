@@ -34,15 +34,14 @@ Gire o **Rotary Encoder** para navegar entre as 6 telas ou clique no botão do E
 
 ---
 
-## 📸 Painel Web (Vigil Web v2.5)
+## 📸 Painel Web (Vigil Web v2.6 — Htop Pro Edition)
 
-Painel responsivo (*Dark Mode Glassmorphism*) com sincronização automática a cada 1.5s via AJAX e suporte a PWA (Progressive Web App):
+Painel responsivo de alta performance (*Dark Mode Glassmorphism Cyberpunk*) com sincronização a cada 1.5s via AJAX e suporte a PWA:
 
-- 🌡️ **Temperatura Térmica da CPU** com indicador dinâmico de cores (Verde < 60°C, Amarelo 60-75°C, Vermelho > 75°C) e sparkline histórica;
-- 📊 **Barras de Gradiente & Histórico:** % de CPU, Memória RAM e Espaço em Disco SSD com curvas ao vivo;
+- ⚡ **Gerenciador de Tarefas Htop Pro em Destaque:** Tabela visual expandida exibindo os **Top 8 Processos Ativos**, contagem total de processos (`276 Processos`), PIDs, usuários (`leo`, `root`), número de threads, badges de status (`RUNNING` / `SLEEPING`) e barras dinâmicas de consumo de CPU e RAM com gradientes;
+- 🏆 **4 Top Cards de KPI Vitais:** Temperatura da CPU com badge de status térmico (`IDEAL < 60°C`), Carga total de CPU (x86_64 4 Cores), Uso de RAM (6.0 GB Total) e Disco SSD com Uptime;
 - ⚡ **DevOps Command Deck na Web:** Botões táteis com confirmação de segurança para executar ações no servidor (`Restart Gaia`, `Restart Agroclima`, `Restart Mosquitto`, `Wake-on-LAN`, `Limpar Buffers`, `Testar Túnel HTTPS`) com feedback de latência;
 - 🎛️ **Controle de Volume do Spotify Deslizante:** Slider contínuo (`0% a 100%`) com ícones dinâmicos (`🔇`, `🔉`, `🔊`) sincronizado com o display físico do Vigil Desk;
-- 📈 **Top 5 Processos em Tempo Real (Mini `htop`):** Tabela compacta com PID, nome do processo, micro-barra de CPU e consumo de memória RAM;
 - 🌐 **Barra de Atalhos do Ecossistema:** Acesso direto a Gaia (`:3000`), Agroclima (`:3001`), Portainer (`:9000`), Adminer (`:8080`) e Túnel Tailscale;
 - 📜 **Console / Drawer de Logs ao Vivo:** Gaveta retrátil na base da tela exibindo stream de eventos em tempo real (`[INFO]`, `[CMD]`, `[WARN]`, `[ALERT]`) com timestamps;
 - ⚡ **Velocímetros de Rede:** Taxa real de Download (RX) e Upload (TX) em KB/s;
