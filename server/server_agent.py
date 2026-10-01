@@ -344,25 +344,33 @@ def get_services_status():
     ], ping_ms
 
 def get_top_processes(limit=8):
-    """Retorna os top processos consumidores de CPU e memória com detalhes enriquecidos estilo htop"""
+    """Retorna os top processos com filtragem de ruído de kernel e ordem estável fixa"""
     if not PSUTIL_AVAILABLE:
         return [
-            {"pid": 1240, "name": "node (gaia)", "user": "leo", "status": "running", "cpu": 6.8, "mem": 8.4, "threads": 14},
-            {"pid": 2315, "name": "postgres", "user": "postgres", "status": "sleeping", "cpu": 2.9, "mem": 12.2, "threads": 8},
-            {"pid": 3142, "name": "dockerd", "user": "root", "status": "sleeping", "cpu": 2.1, "mem": 6.8, "threads": 26},
-            {"pid": 4510, "name": "tailscaled", "user": "root", "status": "running", "cpu": 1.4, "mem": 3.2, "threads": 18},
-            {"pid": 5894, "name": "python3 (agent)", "user": "leo", "status": "running", "cpu": 1.1, "mem": 2.5, "threads": 4},
-            {"pid": 1822, "name": "cmatrix", "user": "leo", "status": "running", "cpu": 0.8, "mem": 0.9, "threads": 1},
-            {"pid": 6012, "name": "mosquitto", "user": "mosquitto", "status": "sleeping", "cpu": 0.4, "mem": 1.2, "threads": 2},
-            {"pid": 7120, "name": "nginx", "user": "root", "status": "sleeping", "cpu": 0.2, "mem": 1.8, "threads": 4}
-        ], 182
+            {"pid": 2221, "name": "gnome-terminal-server", "user": "leo", "status": "running", "cpu": 10.0, "mem": 0.8, "threads": 6},
+            {"pid": 306296, "name": "python3", "user": "leo", "status": "running", "cpu": 9.4, "mem": 0.6, "threads": 4},
+            {"pid": 3616, "name": "cmatrix", "user": "leo", "status": "running", "cpu": 8.0, "mem": 0.1, "threads": 1},
+            {"pid": 10762, "name": "containerd", "user": "root", "status": "sleeping", "cpu": 1.3, "mem": 0.7, "threads": 16},
+            {"pid": 10971, "name": "dockerd", "user": "root", "status": "sleeping", "cpu": 0.7, "mem": 1.5, "threads": 32},
+            {"pid": 12505, "name": "node (gaia)", "user": "root", "status": "sleeping", "cpu": 0.5, "mem": 2.1, "threads": 11},
+            {"pid": 4510, "name": "tailscaled", "user": "root", "status": "running", "cpu": 0.4, "mem": 1.8, "threads": 18},
+            {"pid": 2315, "name": "postgres", "user": "postgres", "status": "sleeping", "cpu": 0.2, "mem": 4.5, "threads": 8}
+        ], 274
     procs = []
     total_pids = len(psutil.pids())
     for p in psutil.process_iter(['pid', 'name', 'username', 'status', 'cpu_percent', 'memory_percent', 'num_threads']):
         try:
             info = p.info
             name = info.get('name') or ''
-            if not name or name.startswith('[') or name in ['kworker', 'systemd-udevd']:
+            # Filtra estritamente threads internas de kernel e daemons de desktop
+            if (not name or 
+                name.startswith('[') or 
+                name.startswith('kworker') or 
+                name.startswith('ksoftirqd') or 
+                name.startswith('migration') or 
+                name.startswith('ibus') or 
+                name.startswith('systemd-') or 
+                name in ['at-spi-bus-launcher', 'at-spi2-registryd', 'dbus-daemon']):
                 continue
             cpu = float(info.get('cpu_percent') or 0.0)
             mem = round(float(info.get('memory_percent') or 0.0), 1)
@@ -377,7 +385,8 @@ def get_top_processes(limit=8):
             })
         except (psutil.NoSuchProcess, psutil.AccessDenied):
             pass
-    procs.sort(key=lambda x: (x['cpu'], x['mem']), reverse=True)
+    # Ordem fixa e estavel por memoria (sem pular de posicao a cada segundo)
+    procs.sort(key=lambda x: (x['mem'], x['name'].lower()), reverse=True)
     return procs[:limit], total_pids
 
 def get_field_station_metrics():
@@ -646,11 +655,15 @@ HTML_DASHBOARD = """<!DOCTYPE html>
     .card-title svg { color: var(--accent); }
 
     /* HTOP PRO PROCESS MONITOR STYLING */
+    .htop-scroll-wrap {
+      overflow-x: auto; -webkit-overflow-scrolling: touch; padding-bottom: 4px;
+    }
     .htop-header {
-      display: flex; justify-content: space-between; align-items: center;
-      padding: 12px 14px; background: rgba(0,0,0,0.3); border-radius: 12px;
-      margin-bottom: 14px; border: 1px solid rgba(255,255,255,0.05); font-family: 'JetBrains Mono', monospace;
-      font-size: 12px;
+      min-width: 550px;
+      display: grid; grid-template-columns: 2.3fr 0.8fr 1fr 1.2fr 1.2fr; gap: 16px;
+      align-items: center; padding: 10px 16px; background: rgba(0,0,0,0.35); border-radius: 12px;
+      margin-bottom: 10px; border: 1px solid rgba(255,255,255,0.05); font-family: 'JetBrains Mono', monospace;
+      font-size: 11px; font-weight: 700; color: var(--text-muted);
     }
     .htop-pill {
       background: rgba(255,255,255,0.06); padding: 4px 10px; border-radius: 8px; font-weight: 700; color: #38bdf8;
@@ -658,10 +671,11 @@ HTML_DASHBOARD = """<!DOCTYPE html>
     
     .proc-list { display: flex; flex-direction: column; gap: 6px; }
     .proc-row {
-      display: grid; grid-template-columns: 2.2fr 0.8fr 1fr 1.3fr 1.3fr;
-      align-items: center; padding: 10px 14px; border-radius: 10px;
+      min-width: 550px;
+      display: grid; grid-template-columns: 2.3fr 0.8fr 1fr 1.2fr 1.2fr; gap: 16px;
+      align-items: center; padding: 10px 16px; border-radius: 12px;
       background: rgba(255, 255, 255, 0.02); border: 1px solid rgba(255,255,255,0.04);
-      font-family: 'JetBrains Mono', monospace; font-size: 12px; transition: all 0.2s;
+      font-family: 'JetBrains Mono', monospace; font-size: 12px; transition: background 0.2s;
     }
     .proc-row:hover {
       background: rgba(255, 255, 255, 0.06); border-color: rgba(6, 182, 212, 0.3);
@@ -903,18 +917,20 @@ HTML_DASHBOARD = """<!DOCTYPE html>
           </div>
         </div>
 
-        <div class="htop-header">
-          <span>PROCESSO / USUÁRIO</span>
-          <span style="text-align:right;">PID</span>
-          <span style="text-align:center;">STATUS</span>
-          <span style="text-align:right;">CPU %</span>
-          <span style="text-align:right;">RAM %</span>
-        </div>
+        <div class="htop-scroll-wrap">
+          <div class="htop-header">
+            <span>PROCESSO / USUÁRIO</span>
+            <div>PID</div>
+            <div style="text-align:center;">STATUS</div>
+            <div style="text-align:right;">CPU %</div>
+            <div style="text-align:right;">RAM %</div>
+          </div>
 
         <div class="proc-list" id="htop-proc-container">
-          <!-- Renderizado dinamicamente com animação -->
-          <div style="padding: 20px; text-align: center; color: var(--text-muted);">
-            Carregando tabela de processos em tempo real...
+            <!-- Renderizado dinamicamente com animação -->
+            <div style="padding: 20px; text-align: center; color: var(--text-muted);">
+              Carregando tabela de processos em tempo real...
+            </div>
           </div>
         </div>
 
@@ -1124,6 +1140,83 @@ HTML_DASHBOARD = """<!DOCTYPE html>
     let lastAlertLevel = 'normal';
     let volDebounce = null;
     let isUserSliding = false;
+    let currentMonitoredPids = '';
+    function renderStableProcessTable(procs) {
+      const container = document.getElementById('htop-proc-container');
+      const pidsKey = procs.map(p => p.pid).join(',');
+      
+      // Se os processos monitorados continuam os mesmos, atualiza apenas os números e barras (ZERO troca de linha!)
+      if (pidsKey === currentMonitoredPids) {
+        procs.forEach(p => {
+          const isHighCpu = p.cpu > 25.0;
+          const isRun = (p.status === 'running');
+          
+          const cpuVal = document.getElementById('p-cpu-val-' + p.pid);
+          if (cpuVal) {
+            cpuVal.innerText = p.cpu.toFixed(1) + '%';
+            cpuVal.style.color = isHighCpu ? '#f87171' : '#38bdf8';
+          }
+          const cpuBar = document.getElementById('p-cpu-bar-' + p.pid);
+          if (cpuBar) {
+            cpuBar.style.width = Math.min(100, Math.max(0, p.cpu)) + '%';
+            cpuBar.className = 'proc-bar-cpu' + (isHighCpu ? ' high' : '');
+          }
+          const ramVal = document.getElementById('p-ram-val-' + p.pid);
+          if (ramVal) ramVal.innerText = p.mem.toFixed(1) + '%';
+          const ramBar = document.getElementById('p-ram-bar-' + p.pid);
+          if (ramBar) ramBar.style.width = Math.min(100, Math.max(0, p.mem)) + '%';
+
+          const stBadge = document.getElementById('p-st-' + p.pid);
+          if (stBadge) {
+            stBadge.className = 'proc-status ' + (isRun ? 'status-running' : 'status-sleeping');
+            stBadge.innerHTML = `<span style="font-size:7px;">●</span> ${p.status.toUpperCase()}`;
+          }
+        });
+        return;
+      }
+
+      // Renderiza a estrutura com identificadores únicos para atualização in-place
+      currentMonitoredPids = pidsKey;
+      container.innerHTML = procs.map(p => {
+        const badge = getProcIcon(p.name);
+        const isHighCpu = p.cpu > 25.0;
+        const isRun = (p.status === 'running');
+        return `
+          <div class="proc-row" id="proc-row-${p.pid}">
+            <div class="proc-name-col">
+              <div class="proc-badge-icon" style="background:${badge.bg}; color:${badge.color};">${badge.icon}</div>
+              <div style="overflow:hidden;">
+                <div class="proc-name-text">${p.name}</div>
+                <div class="proc-user-sub">${p.user || 'leo'} &middot; ${p.threads || 1} th</div>
+              </div>
+            </div>
+            <div class="proc-pid">PID ${p.pid}</div>
+            <div style="text-align:center;">
+              <span class="proc-status ${isRun ? 'status-running' : 'status-sleeping'}" id="p-st-${p.pid}">
+                <span style="font-size:7px;">●</span> ${p.status.toUpperCase()}
+              </span>
+            </div>
+            <div class="proc-meter">
+              <div class="proc-meter-lbl" style="justify-content: flex-end;">
+                <span id="p-cpu-val-${p.pid}" style="color:${isHighCpu ? '#f87171' : '#38bdf8'}; font-weight:700;">${p.cpu.toFixed(1)}%</span>
+              </div>
+              <div class="proc-bar-bg">
+                <div class="proc-bar-cpu ${isHighCpu ? 'high' : ''}" id="p-cpu-bar-${p.pid}" style="width:${Math.min(100, Math.max(0, p.cpu))}%"></div>
+              </div>
+            </div>
+            <div class="proc-meter">
+              <div class="proc-meter-lbl" style="justify-content: flex-end;">
+                <span id="p-ram-val-${p.pid}" style="color:#c084fc; font-weight:700;">${p.mem.toFixed(1)}%</span>
+              </div>
+              <div class="proc-bar-bg">
+                <div class="proc-bar-ram" id="p-ram-bar-${p.pid}" style="width:${Math.min(100, Math.max(0, p.mem))}%"></div>
+              </div>
+            </div>
+          </div>
+        `;
+      }).join('');
+    }
+
 
     function toggleSound() {
       soundEnabled = !soundEnabled;
@@ -1323,52 +1416,12 @@ HTML_DASHBOARD = """<!DOCTYPE html>
           drawSparkline('canvas-temp', h_temp, '#f59e0b', 'rgba(245, 158, 11, 0.25)', 30, 85);
         }
 
-        // HTOP PRO TOP PROCESSOS
+        // HTOP PRO TOP PROCESSOS (Ordem Fixa & Atualização In-Place sem Pulos)
         if (data.total_processes_count) {
           document.getElementById('total-procs-badge').innerText = `${data.total_processes_count} Processos Ativos`;
         }
         if (data.top_processes && Array.isArray(data.top_processes)) {
-          const container = document.getElementById('htop-proc-container');
-          container.innerHTML = data.top_processes.map(p => {
-            const badge = getProcIcon(p.name);
-            const isHighCpu = p.cpu > 25.0;
-            const isRun = (p.status === 'running');
-            return `
-              <div class="proc-row">
-                <div class="proc-name-col">
-                  <div class="proc-badge-icon" style="background:${badge.bg}; color:${badge.color};">${badge.icon}</div>
-                  <div style="overflow:hidden;">
-                    <div class="proc-name-text">${p.name}</div>
-                    <div class="proc-user-sub">${p.user || 'leo'} &middot; ${p.threads || 1} th</div>
-                  </div>
-                </div>
-                <div class="proc-pid">PID ${p.pid}</div>
-                <div style="text-align:center;">
-                  <span class="proc-status ${isRun ? 'status-running' : 'status-sleeping'}">
-                    <span style="font-size:7px;">●</span> ${p.status.toUpperCase()}
-                  </span>
-                </div>
-                <div class="proc-meter">
-                  <div class="proc-meter-lbl">
-                    <span style="color:var(--text-muted);">CPU</span>
-                    <span style="color:${isHighCpu ? '#f87171' : '#38bdf8'};">${p.cpu.toFixed(1)}%</span>
-                  </div>
-                  <div class="proc-bar-bg">
-                    <div class="proc-bar-cpu ${isHighCpu ? 'high' : ''}" style="width:${Math.min(100, Math.max(0, p.cpu))}%"></div>
-                  </div>
-                </div>
-                <div class="proc-meter">
-                  <div class="proc-meter-lbl">
-                    <span style="color:var(--text-muted);">RAM</span>
-                    <span style="color:#c084fc;">${p.mem.toFixed(1)}%</span>
-                  </div>
-                  <div class="proc-bar-bg">
-                    <div class="proc-bar-ram" style="width:${Math.min(100, Math.max(0, p.mem))}%"></div>
-                  </div>
-                </div>
-              </div>
-            `;
-          }).join('');
+          renderStableProcessTable(data.top_processes);
         }
 
         // Estação de Campo
