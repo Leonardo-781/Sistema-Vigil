@@ -330,6 +330,7 @@ def get_services_status():
     t0 = time.time()
     s_gaia = check_port('127.0.0.1', 3000)
     s_agro = check_port('127.0.0.1', 3001)
+    s_flash = check_port('127.0.0.1', 8085)
     s_pg = check_port('127.0.0.1', 5432)
     s_mqtt = check_port('127.0.0.1', 1883)
     s_nginx = check_port('127.0.0.1', 80)
@@ -338,6 +339,7 @@ def get_services_status():
     return [
         {"name": "Gaia Server", "port": 3000, "status": s_gaia, "type": "API / Backend"},
         {"name": "Agroclima Server", "port": 3001, "status": s_agro, "type": "Microserviço"},
+        {"name": "GH2O Web Flash", "port": 8085, "status": s_flash, "type": "Firmware Flasher"},
         {"name": "PostgreSQL DB", "port": 5432, "status": s_pg, "type": "Banco de Dados"},
         {"name": "Mosquitto MQTT", "port": 1883, "status": s_mqtt, "type": "Broker IoT"},
         {"name": "Nginx Proxy", "port": 80, "status": s_nginx, "type": "Reverse Proxy"}
@@ -848,7 +850,10 @@ HTML_DASHBOARD = """<!DOCTYPE html>
         <span class="eco-dot"></span> 🗄️ Adminer DB (:8080)
       </a>
       <a href="https://server1.taila7d06b.ts.net:10000" target="_blank" class="eco-chip">
-        <span class="eco-dot" style="background:#06b6d4;"></span> 🔒 Túnel Tailscale HTTPS
+        <span class="eco-dot" style="background:#06b6d4;"></span> 🔒 Vigil HTTPS
+      </a>
+      <a href="https://server1.taila7d06b.ts.net/webflash/" target="_blank" class="eco-chip">
+        <span class="eco-dot" style="background:#38bdf8;"></span> ⚡ GH2O Web Flash
       </a>
     </div>
 
@@ -1558,6 +1563,7 @@ class MonitorHandler(BaseHTTPRequestHandler):
             srvc_map = {
                 "serverApiOk": any(s["port"] == 3000 and s["status"] for s in services),
                 "agroclimaOk": any(s["port"] == 3001 and s["status"] for s in services),
+                "webflashOk": any(s["port"] == 8085 and s["status"] for s in services),
                 "postgresOk": any(s["port"] == 5432 and s["status"] for s in services),
                 "mosquittoOk": any(s["port"] == 1883 and s["status"] for s in services),
                 "pingMs": ping_ms
